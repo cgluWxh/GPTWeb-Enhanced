@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.6.4
+// @version      0.6.5
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -258,7 +258,7 @@
     }
     const message = getParentElement(range.commonAncestorContainer)
       ?.closest(MESSAGE_SELECTOR);
-    const turnID = getValidTurnID(
+    const turnID = getTurnIndex(
       getParentElement(range.commonAncestorContainer)
     );
     const messageOffsets = message
@@ -369,7 +369,7 @@
     if (existingIndex !== -1) {
       const [existingBookmark] = bookmarks.splice(existingIndex, 1);
       existingBookmark.createdAt = Date.now();
-      if (selectionInfo.turnID) {
+      if (isValidTurnID(selectionInfo.turnID)) {
         existingBookmark.turnID = selectionInfo.turnID;
       }
       if (replyContent) {
@@ -678,14 +678,7 @@
       return null;
     }
 
-    const escapedTurnID =
-      typeof CSS.escape === 'function'
-        ? CSS.escape(turnID)
-        : turnID.replace(/["\\]/g, '\\$&');
-
-    return document.querySelector(
-      `div[data-turn-id-container="${escapedTurnID}"]`
-    );
+    return getTurnContainers()[turnID] ?? null;
   }
 
   function backfillTurnID(bookmark, field, targetElement) {
@@ -693,9 +686,9 @@
       return;
     }
 
-    const turnID = getValidTurnID(targetElement);
+    const turnID = getTurnIndex(targetElement);
 
-    if (!turnID) {
+    if (!isValidTurnID(turnID)) {
       delete bookmark[field];
       return;
     }
@@ -705,56 +698,50 @@
   }
 
   function isValidTurnID(turnID) {
-    return (
-      typeof turnID === 'string' &&
-      turnID.length > 0 &&
-      !turnID.startsWith('request-WEB')
-    );
+    return Number.isInteger(turnID) && turnID >= 0;
   }
 
   function discardInvalidTurnID(bookmark, field) {
-    if (bookmark[field] && !isValidTurnID(bookmark[field])) {
+    if (bookmark[field] != null && !isValidTurnID(bookmark[field])) {
       delete bookmark[field];
       saveBookmarks();
     }
   }
 
-  function getValidTurnID(targetElement) {
-    let turnContainer =
-      targetElement?.closest('div[data-turn-id-container]') ?? null;
+  function getTurnContainers() {
+    return [...document.querySelectorAll(
+      'div[data-turn-id-container]'
+    )].filter(
+      element =>
+        element.getAttribute('data-turn-id-container') !==
+        'client-created-root'
+    );
+  }
 
-    while (turnContainer) {
-      const turnID = turnContainer.getAttribute(
-        'data-turn-id-container'
-      );
+  function getTurnIndex(targetElement) {
+    const turnContainers = getTurnContainers();
+    let current = targetElement;
 
-      if (isValidTurnID(turnID)) {
-        return turnID;
+    while (current) {
+      const index = turnContainers.indexOf(current);
+
+      if (index !== -1) {
+        return index;
       }
 
-      turnContainer = turnContainer.parentElement?.closest(
-        'div[data-turn-id-container]'
-      ) ?? null;
+      current = current.parentElement;
     }
 
     return null;
   }
 
   function monitorPendingReply(selectionInfo, replyContent) {
-    const initialTurns = [...document.querySelectorAll(
-      'div[data-turn-id-container]'
-    )];
+    const initialTurns = getTurnContainers();
     const initialTurnCount = initialTurns.length;
-    const initialTurnIDs = new Set(
-      initialTurns.map(turn =>
-        turn.getAttribute('data-turn-id-container')
-      )
-    );
 
     const timer = setInterval(() => {
-      const currentTurnCount = document.querySelectorAll(
-        'div[data-turn-id-container]'
-      ).length;
+      const currentTurns = getTurnContainers();
+      const currentTurnCount = currentTurns.length;
 
       if (currentTurnCount === initialTurnCount) {
         return;
@@ -763,26 +750,19 @@
       clearInterval(timer);
       replyTurnMonitorTimers.delete(timer);
 
-      const newTurns = [...document.querySelectorAll(
-        'div[data-turn-id-container]'
-      )].filter(
-        turn =>
-          !initialTurnIDs.has(
-            turn.getAttribute('data-turn-id-container')
-          )
-      );
+      const newTurns = currentTurns.slice(initialTurnCount);
       let replyTurnID = null;
 
       for (let index = newTurns.length - 1; index >= 0; index--) {
         const match = findReplyMatch(newTurns[index], replyContent);
 
         if (match) {
-          replyTurnID = getValidTurnID(match.targetMessage);
+          replyTurnID = getTurnIndex(match.targetMessage);
           break;
         }
       }
 
-      if (replyTurnID) {
+      if (isValidTurnID(replyTurnID)) {
         createBookmarkFromPendingSelection(
           replyContent,
           selectionInfo,
