@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.5.8
+// @version      0.5.9
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -346,7 +346,7 @@
    * Bookmark creation
    */
 
-  function createBookmarkFromPendingSelection() {
+  function createBookmarkFromPendingSelection(replyContent = '') {
     if (!pendingSelection) {
       hideBookmarkButton();
       return false;
@@ -359,6 +359,9 @@
     if (existingIndex !== -1) {
       const [existingBookmark] = bookmarks.splice(existingIndex, 1);
       existingBookmark.createdAt = Date.now();
+      if (replyContent) {
+        existingBookmark.replyContent = replyContent.trim();
+      }
       bookmarks.unshift(existingBookmark);
       saveBookmarks();
       renderBookmarks();
@@ -377,6 +380,7 @@
 
       text: pendingSelection.text,
       formulaLatex: pendingSelection.formulaLatex,
+      replyContent: replyContent.trim() || null,
 
       rootIndex: pendingSelection.rootIndex,
 
@@ -507,6 +511,57 @@
       scrollRangeToCenter(freshScrollRoot, freshRange);
       highlightRange(freshRange);
     }, 500);
+  }
+
+  function jumpToReply(bookmark) {
+    const replyContent = normalizeText(bookmark.replyContent);
+
+    if (!replyContent) {
+      showToast('该 Bookmark 没有 Reply 内容');
+      return;
+    }
+
+    const messages = [...document.querySelectorAll(MESSAGE_SELECTOR)];
+    const userMessages = messages.filter(
+      message =>
+        message.getAttribute('data-message-author-role') === 'user'
+    );
+    const candidates = userMessages.length ? userMessages : messages;
+    let targetMessage = null;
+    let targetRange = null;
+
+    for (let index = candidates.length - 1; index >= 0; index--) {
+      const message = candidates[index];
+      const range = locateByNormalizedText(message, {
+        text: replyContent,
+      });
+
+      if (range) {
+        targetMessage = message;
+        targetRange = range;
+        break;
+      }
+    }
+
+    if (!targetMessage || !targetRange) {
+      showToast('找不到对应的 Reply，消息可能尚未发送');
+      return;
+    }
+
+    const scrollRoot =
+      targetMessage.closest(SCROLL_ROOT_SELECTOR) ||
+      resolveScrollRoot(bookmark);
+
+    if (scrollRoot) {
+      scrollRangeToCenter(scrollRoot, targetRange);
+    } else {
+      targetMessage.scrollIntoView({
+        behavior: 'instant',
+        block: 'center',
+      });
+    }
+
+    highlightRange(targetRange);
   }
 
   function locateBookmarkRange(scrollRoot, bookmark) {
@@ -1130,7 +1185,9 @@
     const addButton = document.createElement('button');
     addButton.type = 'button';
     addButton.textContent = 'Bookmark';
-    addButton.addEventListener('click', createBookmarkFromPendingSelection);
+    addButton.addEventListener('click', () => {
+      createBookmarkFromPendingSelection();
+    });
 
     const markdownButton = document.createElement('button');
     markdownButton.type = 'button';
@@ -1257,7 +1314,7 @@
       return;
     }
 
-    const bookmarkResult = createBookmarkFromPendingSelection();
+    const bookmarkResult = createBookmarkFromPendingSelection(quote);
     showToast(
       bookmarkResult === 'added'
         ? '已插入 Reply 并添加 Bookmark'
@@ -1722,6 +1779,17 @@
         jumpToBookmark(bookmark);
       });
 
+      const replyJumpButton = document.createElement('button');
+      replyJumpButton.type = 'button';
+      replyJumpButton.className = 'tm-bookmark-reply-jump';
+      replyJumpButton.title = '跳转到 Reply';
+      replyJumpButton.setAttribute('aria-label', '跳转到 Reply');
+      replyJumpButton.textContent = '↪';
+      replyJumpButton.addEventListener('click', event => {
+        event.stopPropagation();
+        jumpToReply(bookmark);
+      });
+
       const deleteButton = document.createElement('button');
       deleteButton.type = 'button';
       deleteButton.className = 'tm-bookmark-delete';
@@ -1734,7 +1802,11 @@
         deleteBookmark(bookmark.id);
       });
 
-      item.append(jumpButton, deleteButton);
+      item.append(jumpButton);
+      if (bookmark.replyContent) {
+        item.append(replyJumpButton);
+      }
+      item.append(deleteButton);
       item.addEventListener('contextmenu', event => {
         event.preventDefault();
         renameBookmark(bookmark);
@@ -2210,6 +2282,7 @@
         line-height: 1.2;
       }
 
+      .tm-bookmark-reply-jump,
       .tm-bookmark-delete {
         all: unset;
         align-self: center;
@@ -2224,6 +2297,17 @@
         font-size: 18px;
         line-height: 1;
         cursor: pointer;
+      }
+
+      .tm-bookmark-reply-jump {
+        margin-right: 0;
+        color: rgba(37, 99, 235, 0.72);
+        font-size: 17px;
+      }
+
+      .tm-bookmark-reply-jump:hover {
+        background: rgba(37, 99, 235, 0.12);
+        color: rgb(37, 99, 235);
       }
 
       .tm-bookmark-delete:hover {
