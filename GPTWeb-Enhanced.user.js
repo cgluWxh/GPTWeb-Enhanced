@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.5.7
+// @version      0.5.8
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -352,16 +352,23 @@
       return false;
     }
 
-    if (
-      bookmarks.some(bookmark =>
-        isSameBookmarkLocation(bookmark, pendingSelection)
-      )
-    ) {
+    const existingIndex = bookmarks.findIndex(bookmark =>
+      isSameBookmarkLocation(bookmark, pendingSelection)
+    );
+
+    if (existingIndex !== -1) {
+      const [existingBookmark] = bookmarks.splice(existingIndex, 1);
+      existingBookmark.createdAt = Date.now();
+      bookmarks.unshift(existingBookmark);
+      saveBookmarks();
+      renderBookmarks();
+
       hideBookmarkButton();
       clearBrowserSelection();
       setWindowCollapsed(false);
-      showToast('该位置已有 Bookmark');
-      return false;
+      flashWindow();
+      showToast('已刷新 Bookmark');
+      return 'updated';
     }
 
     const bookmark = {
@@ -398,7 +405,7 @@
 
     setWindowCollapsed(false);
     flashWindow();
-    return true;
+    return 'added';
   }
 
   function isSameBookmarkLocation(bookmark, selectionInfo) {
@@ -1250,11 +1257,13 @@
       return;
     }
 
-    const bookmarkAdded = createBookmarkFromPendingSelection();
+    const bookmarkResult = createBookmarkFromPendingSelection();
     showToast(
-      bookmarkAdded
+      bookmarkResult === 'added'
         ? '已插入 Reply 并添加 Bookmark'
-        : '已插入 Reply；该位置已有 Bookmark'
+        : bookmarkResult === 'updated'
+          ? '已插入 Reply 并刷新 Bookmark'
+          : '已插入 Reply'
     );
   }
 
