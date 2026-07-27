@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.5.6
+// @version      0.5.7
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -349,7 +349,19 @@
   function createBookmarkFromPendingSelection() {
     if (!pendingSelection) {
       hideBookmarkButton();
-      return;
+      return false;
+    }
+
+    if (
+      bookmarks.some(bookmark =>
+        isSameBookmarkLocation(bookmark, pendingSelection)
+      )
+    ) {
+      hideBookmarkButton();
+      clearBrowserSelection();
+      setWindowCollapsed(false);
+      showToast('该位置已有 Bookmark');
+      return false;
     }
 
     const bookmark = {
@@ -386,6 +398,58 @@
 
     setWindowCollapsed(false);
     flashWindow();
+    return true;
+  }
+
+  function isSameBookmarkLocation(bookmark, selectionInfo) {
+    if (
+      bookmark.messageId &&
+      bookmark.messageId === selectionInfo.messageId &&
+      hasNonEmptyOffsets(bookmark.messageStart, bookmark.messageEnd) &&
+      hasNonEmptyOffsets(
+        selectionInfo.messageStart,
+        selectionInfo.messageEnd
+      ) &&
+      bookmark.messageStart === selectionInfo.messageStart &&
+      bookmark.messageEnd === selectionInfo.messageEnd
+    ) {
+      return true;
+    }
+
+    if (
+      bookmark.rootIndex === selectionInfo.rootIndex &&
+      hasNonEmptyOffsets(bookmark.start, bookmark.end) &&
+      hasNonEmptyOffsets(selectionInfo.start, selectionInfo.end) &&
+      bookmark.start === selectionInfo.start &&
+      bookmark.end === selectionInfo.end
+    ) {
+      return true;
+    }
+
+    return (
+      bookmark.rootIndex === selectionInfo.rootIndex &&
+      bookmark.startOffset === selectionInfo.startOffset &&
+      bookmark.endOffset === selectionInfo.endOffset &&
+      areNodePathsEqual(bookmark.startPath, selectionInfo.startPath) &&
+      areNodePathsEqual(bookmark.endPath, selectionInfo.endPath)
+    );
+  }
+
+  function hasNonEmptyOffsets(start, end) {
+    return (
+      Number.isInteger(start) &&
+      Number.isInteger(end) &&
+      end > start
+    );
+  }
+
+  function areNodePathsEqual(left, right) {
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value, index) => value === right[index])
+    );
   }
 
   /**
@@ -1186,8 +1250,12 @@
       return;
     }
 
-    createBookmarkFromPendingSelection();
-    showToast('已插入 Reply 并添加 Bookmark');
+    const bookmarkAdded = createBookmarkFromPendingSelection();
+    showToast(
+      bookmarkAdded
+        ? '已插入 Reply 并添加 Bookmark'
+        : '已插入 Reply；该位置已有 Bookmark'
+    );
   }
 
   function getReplySelectionData(message, range) {
