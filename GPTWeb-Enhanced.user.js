@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.5.4
+// @version      0.5.5
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -1134,9 +1134,8 @@
       return;
     }
 
-    hideBookmarkButton();
-    clearBrowserSelection();
-    showToast('已插入 Reply');
+    createBookmarkFromPendingSelection();
+    showToast('已插入 Reply 并添加 Bookmark');
   }
 
   function getReplySelectionData(message, range) {
