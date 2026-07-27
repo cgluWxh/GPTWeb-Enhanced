@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.5.9
+// @version      0.6.0
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -256,6 +256,8 @@
     }
     const message = getParentElement(range.commonAncestorContainer)
       ?.closest(MESSAGE_SELECTOR);
+    const turnContainer = getParentElement(range.commonAncestorContainer)
+      ?.closest('[data-turn-id-container]');
     const messageOffsets = message
       ? getCanonicalRangeOffsets(message, range)
       : null;
@@ -265,6 +267,8 @@
       scrollRoot,
       text: canonicalText,
       formulaLatex: formulaLatex || null,
+      turnID:
+        turnContainer?.getAttribute('data-turn-id-container') ?? null,
       start,
       end,
       prefix: fullText.slice(
@@ -359,8 +363,12 @@
     if (existingIndex !== -1) {
       const [existingBookmark] = bookmarks.splice(existingIndex, 1);
       existingBookmark.createdAt = Date.now();
+      if (pendingSelection.turnID) {
+        existingBookmark.turnID = pendingSelection.turnID;
+      }
       if (replyContent) {
         existingBookmark.replyContent = replyContent.trim();
+        existingBookmark.replyTurnID = null;
       }
       bookmarks.unshift(existingBookmark);
       saveBookmarks();
@@ -381,6 +389,8 @@
       text: pendingSelection.text,
       formulaLatex: pendingSelection.formulaLatex,
       replyContent: replyContent.trim() || null,
+      turnID: pendingSelection.turnID,
+      replyTurnID: null,
 
       rootIndex: pendingSelection.rootIndex,
 
@@ -468,6 +478,26 @@
    */
 
   function jumpToBookmark(bookmark) {
+    if (bookmark.turnID) {
+      const turnContainer = findTurnContainer(bookmark.turnID);
+
+      if (!turnContainer) {
+        showToast('找不到对应的 Turn，内容可能尚未加载');
+        return;
+      }
+
+      turnContainer.scrollIntoView({
+        behavior: 'instant',
+        block: 'center',
+      });
+      setTimeout(() => performBookmarkJump(bookmark, true), 100);
+      return;
+    }
+
+    performBookmarkJump(bookmark, false);
+  }
+
+  function performBookmarkJump(bookmark, retryOnFailure) {
     const scrollRoot = resolveScrollRoot(bookmark);
 
     if (!scrollRoot) {
@@ -478,6 +508,10 @@
     const range = locateBookmarkRange(scrollRoot, bookmark);
 
     if (!range) {
+      if (retryOnFailure) {
+        setTimeout(() => performBookmarkJump(bookmark, false), 500);
+        return;
+      }
       showToast('找不到这段文本，页面内容可能已经变化');
       return;
     }
@@ -489,6 +523,7 @@
       return;
     }
 
+    backfillTurnID(bookmark, 'turnID', targetElement);
     scrollRangeToCenter(scrollRoot, range);
     highlightRange(range);
 
@@ -521,7 +556,45 @@
       return;
     }
 
-    const messages = [...document.querySelectorAll(MESSAGE_SELECTOR)];
+    if (bookmark.replyTurnID) {
+      const turnContainer = findTurnContainer(bookmark.replyTurnID);
+
+      if (!turnContainer) {
+        showToast('找不到对应的 Reply Turn，内容可能尚未加载');
+        return;
+      }
+
+      turnContainer.scrollIntoView({
+        behavior: 'instant',
+        block: 'center',
+      });
+      setTimeout(() => {
+        if (!performReplyJump(bookmark, turnContainer, false)) {
+          setTimeout(() => {
+            const freshTurn = findTurnContainer(bookmark.replyTurnID);
+            performReplyJump(bookmark, freshTurn, true);
+          }, 500);
+        }
+      }, 100);
+      return;
+    }
+
+    performReplyJump(bookmark, document, true);
+  }
+
+  function performReplyJump(bookmark, searchRoot, showFailure) {
+    if (!searchRoot) {
+      if (showFailure) {
+        showToast('找不到对应的 Reply Turn，内容可能尚未加载');
+      }
+      return false;
+    }
+
+    const replyContent = normalizeText(bookmark.replyContent);
+    const messages = [
+      ...(searchRoot.matches?.(MESSAGE_SELECTOR) ? [searchRoot] : []),
+      ...searchRoot.querySelectorAll(MESSAGE_SELECTOR),
+    ];
     const userMessages = messages.filter(
       message =>
         message.getAttribute('data-message-author-role') === 'user'
@@ -544,9 +617,13 @@
     }
 
     if (!targetMessage || !targetRange) {
-      showToast('找不到对应的 Reply，消息可能尚未发送');
-      return;
+      if (showFailure) {
+        showToast('找不到对应的 Reply，消息可能尚未发送');
+      }
+      return false;
     }
+
+    backfillTurnID(bookmark, 'replyTurnID', targetMessage);
 
     const scrollRoot =
       targetMessage.closest(SCROLL_ROOT_SELECTOR) ||
@@ -562,6 +639,39 @@
     }
 
     highlightRange(targetRange);
+    return true;
+  }
+
+  function findTurnContainer(turnID) {
+    if (!turnID) {
+      return null;
+    }
+
+    const escapedTurnID =
+      typeof CSS.escape === 'function'
+        ? CSS.escape(turnID)
+        : turnID.replace(/["\\]/g, '\\$&');
+
+    return document.querySelector(
+      `div[data-turn-id-container="${escapedTurnID}"]`
+    );
+  }
+
+  function backfillTurnID(bookmark, field, targetElement) {
+    if (bookmark[field]) {
+      return;
+    }
+
+    const turnID = targetElement
+      ?.closest('[data-turn-id-container]')
+      ?.getAttribute('data-turn-id-container');
+
+    if (!turnID) {
+      return;
+    }
+
+    bookmark[field] = turnID;
+    saveBookmarks();
   }
 
   function locateBookmarkRange(scrollRoot, bookmark) {
