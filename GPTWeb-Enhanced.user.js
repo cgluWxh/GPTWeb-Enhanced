@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.5.5
+// @version      0.5.6
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -222,6 +222,14 @@
     }
 
     const selectedFormulas = getIntersectedKatexElements(scrollRoot, range);
+    const selectedFormula =
+      selectedFormulas.length === 1 &&
+      isRangeInsideKatex(range, selectedFormulas[0])
+        ? selectedFormulas[0]
+        : null;
+    const formulaLatex = selectedFormula
+      ? getKatexLatex(selectedFormula)
+      : '';
     const absoluteOffsets =
       getCanonicalRangeOffsets(scrollRoot, range) ||
       (selectedFormulas.length ? { start: 0, end: 0 } : null);
@@ -238,6 +246,7 @@
       .filter(Boolean)
       .join(' ');
     const canonicalText =
+      (formulaLatex ? `$${formulaLatex}$` : '') ||
       fullText.slice(start, end).trim() ||
       selectedLatexText ||
       text;
@@ -255,6 +264,7 @@
       range: range.cloneRange(),
       scrollRoot,
       text: canonicalText,
+      formulaLatex: formulaLatex || null,
       start,
       end,
       prefix: fullText.slice(
@@ -302,13 +312,27 @@
   }
 
   function getKatexMarkdown(element) {
-    const rawTex = element
-      .querySelector('annotation[encoding="application/x-tex"]')
-      ?.textContent;
+    const rawTex = getKatexLatex(element);
 
     return rawTex
       ? `$${rawTex}$`
       : '';
+  }
+
+  function getKatexLatex(element) {
+    return element
+      .querySelector('annotation[encoding="application/x-tex"]')
+      ?.textContent
+      ?.trim() ?? '';
+  }
+
+  function isRangeInsideKatex(range, katexElement) {
+    return (
+      getParentElement(range.startContainer)?.closest('.katex') ===
+        katexElement &&
+      getParentElement(range.endContainer)?.closest('.katex') ===
+        katexElement
+    );
   }
 
   function getParentElement(node) {
@@ -333,6 +357,7 @@
       createdAt: Date.now(),
 
       text: pendingSelection.text,
+      formulaLatex: pendingSelection.formulaLatex,
 
       rootIndex: pendingSelection.rootIndex,
 
@@ -418,8 +443,32 @@
       locateInMessage(bookmark) ||
       locateByDomPath(scrollRoot, bookmark) ||
       locateByAbsoluteOffsets(scrollRoot, bookmark) ||
+      locateKatexFormula(scrollRoot, bookmark) ||
       locateByTextContext(scrollRoot, bookmark)
     );
+  }
+
+  function locateKatexFormula(root, bookmark) {
+    const formulaLatex =
+      bookmark.formulaLatex ||
+      (/^\$([\s\S]+)\$$/.exec(bookmark.text)?.[1] ?? '');
+
+    if (!formulaLatex) {
+      return null;
+    }
+
+    const formula = [...root.querySelectorAll('.katex')].find(
+      element => getKatexLatex(element) === formulaLatex
+    );
+    const visibleFormula = formula?.querySelector('.katex-html') || formula;
+
+    if (!visibleFormula) {
+      return null;
+    }
+
+    const range = document.createRange();
+    range.selectNodeContents(visibleFormula);
+    return range;
   }
 
   function locateInMessage(bookmark) {
@@ -457,7 +506,10 @@
 
     // Message ids are stable across re-renders; contextual text search inside
     // one message is much safer than searching the entire conversation.
-    return locateByTextContext(message, bookmark);
+    return (
+      locateKatexFormula(message, bookmark) ||
+      locateByTextContext(message, bookmark)
+    );
   }
 
   function resolveScrollRoot(bookmark) {
