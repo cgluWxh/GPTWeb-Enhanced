@@ -64,7 +64,7 @@
    */
 
   function handleSelectionEnd(event) {
-    // 等 Selection 状态稳定。
+    // Wait for the selection to be updated before checking it.
     requestAnimationFrame(() => {
       showBookmarkButtonForCurrentSelection(event.clientX, event.clientY);
     });
@@ -138,7 +138,7 @@
     event.stopImmediatePropagation();
     event.clipboardData.setData('text/plain', markdown);
     event.clipboardData.setData('text/markdown', markdown);
-    showToast('已复制 Markdown');
+    showToast('Markdown Copied');
   }
 
   function showBookmarkButtonForCurrentSelection(fallbackX, fallbackY) {
@@ -215,7 +215,7 @@
       return null;
     }
 
-    // 防止一个选区跨出 scroll-root。
+    // Prevent selections that span outside the scroll root, which can happen
     if (
       !scrollRoot.contains(range.startContainer) ||
       !scrollRoot.contains(range.endContainer)
@@ -384,7 +384,7 @@
       clearBrowserSelection();
       setWindowCollapsed(false);
       flashWindow();
-      showToast('已刷新 Bookmark');
+      showToast('Bookmark Updated');
       return {
         status: 'updated',
         bookmark: existingBookmark,
@@ -496,7 +496,7 @@
       const turnContainer = findTurnContainer(bookmark.turnID);
 
       if (!turnContainer) {
-        showToast('找不到对应的 Turn，内容可能尚未加载');
+        showToast('Cannot find the corresponding Turn, content may not be loaded yet');
         return;
       }
 
@@ -515,7 +515,7 @@
     const scrollRoot = resolveScrollRoot(bookmark);
 
     if (!scrollRoot) {
-      showToast('找不到 data-scroll-root');
+      showToast('Cannot find data-scroll-root');
       return;
     }
 
@@ -526,14 +526,14 @@
         setTimeout(() => performBookmarkJump(bookmark, false), 500);
         return;
       }
-      showToast('找不到这段文本，页面内容可能已经变化');
+      showToast('Cannot find this text, the page content may have changed');
       return;
     }
 
     const targetElement = getParentElement(range.startContainer);
 
     if (!targetElement) {
-      showToast('无法定位目标元素');
+      showToast('Cannot locate the target element, the page content may have changed');
       return;
     }
 
@@ -566,7 +566,7 @@
     const replyContent = normalizeText(bookmark.replyContent);
 
     if (!replyContent) {
-      showToast('该 Bookmark 没有 Reply 内容');
+      showToast('Cannot find the Reply content for this Bookmark');
       return;
     }
 
@@ -576,7 +576,7 @@
       const turnContainer = findTurnContainer(bookmark.replyTurnID);
 
       if (!turnContainer) {
-        showToast('找不到对应的 Reply Turn，内容可能尚未加载');
+        showToast('Cannot find the corresponding Reply Turn, content may not be loaded yet');
         return;
       }
 
@@ -601,7 +601,7 @@
   function performReplyJump(bookmark, searchRoot, showFailure) {
     if (!searchRoot) {
       if (showFailure) {
-        showToast('找不到对应的 Reply Turn，内容可能尚未加载');
+        showToast('Cannot find the corresponding Reply Turn, content may not be loaded yet');
       }
       return false;
     }
@@ -610,7 +610,7 @@
 
     if (!match) {
       if (showFailure) {
-        showToast('找不到对应的 Reply，消息可能尚未发送');
+        showToast('Cannot find the corresponding Reply, the message may not have been sent yet');
       }
       return false;
     }
@@ -788,7 +788,7 @@
           selectionInfo,
           replyTurnID
         );
-        showToast('Reply 已发送并添加 Bookmark');
+        showToast('Reply has been sent and Bookmark added');
       }
     }, 250);
 
@@ -972,7 +972,7 @@
     const candidates = findAllOccurrences(fullText, bookmark.text);
 
     if (!candidates.length) {
-      // 最后尝试一次忽略连续空白差异的模糊搜索。
+      // If no exact matches are found, try a fuzzy search that ignores consecutive whitespace differences.
       return locateByNormalizedText(scrollRoot, bookmark);
     }
 
@@ -1100,7 +1100,7 @@
       return;
     }
 
-    // 老浏览器降级方案：使用 Selection。
+    // Use the Selection API as a fallback for browsers that don't support CSS.highlights.
     const selection = window.getSelection();
     selection?.removeAllRanges();
     selection?.addRange(range);
@@ -1429,7 +1429,7 @@
 
     const markdownButton = document.createElement('button');
     markdownButton.type = 'button';
-    markdownButton.textContent = '复制 Markdown';
+    markdownButton.textContent = 'Copy Markdown';
     markdownButton.addEventListener('click', copyPendingSelectionAsMarkdown);
 
     const replyButton = document.createElement('button');
@@ -1459,7 +1459,7 @@
     const markdown = domSelectionToMarkdown(container, range);
 
     if (!markdown) {
-      showToast('选区中没有可复制的正文');
+      showToast('No content to copy as Markdown');
       return;
     }
 
@@ -1476,21 +1476,21 @@
       textarea.remove();
 
       if (!copied) {
-        showToast('复制失败，请检查剪贴板权限');
+        showToast('Copy failed, please check clipboard permissions');
         return;
       }
     }
 
     hideBookmarkButton();
     clearBrowserSelection();
-    showToast('已复制 Markdown');
+    showToast('Markdown Copied');
   }
 
   function replyToPendingSelection() {
     const selectionInfo = pendingSelection;
 
     if (!selectionInfo?.messageId) {
-      showToast('Reply 选区必须位于同一条消息内');
+      showToast('Reply failed: no message ID found for the selection');
       return;
     }
 
@@ -1500,7 +1500,7 @@
     );
 
     if (!message) {
-      showToast('找不到选区所在的消息');
+      showToast('Cannot find the message for the selection');
       return;
     }
 
@@ -1510,7 +1510,7 @@
     );
 
     if (!replySelection) {
-      showToast('无法提取当前选区');
+      showToast('Cannot determine the selected text for reply');
       return;
     }
 
@@ -1530,7 +1530,7 @@
     );
 
     if (!selectedText) {
-      showToast('选区中没有可引用的正文');
+      showToast('No text selected for reply');
       return;
     }
 
@@ -1548,14 +1548,14 @@
     ].join('');
 
     if (!insertPlainTextIntoPrompt(quote)) {
-      showToast('找不到 ChatGPT 输入框');
+      showToast('Cannot find the ChatGPT input field');
       return;
     }
 
     hideBookmarkButton();
     clearBrowserSelection();
     monitorPendingReply(selectionInfo, quote);
-    showToast('已插入 Reply，发送后添加 Bookmark');
+    showToast('Bookmark will be added after sending');
   }
 
   function getReplySelectionData(message, range) {
@@ -1950,7 +1950,7 @@
     const collapseButton = document.createElement('button');
     collapseButton.type = 'button';
     collapseButton.className = 'tm-bookmark-icon-button';
-    collapseButton.title = '折叠';
+    collapseButton.title = 'Collapse';
     collapseButton.textContent = '−';
 
     collapseButton.addEventListener('click', () => {
@@ -1971,7 +1971,7 @@
 
     emptyMessage = document.createElement('div');
     emptyMessage.className = 'tm-bookmark-empty';
-    emptyMessage.textContent = '还没有 Bookmark';
+    emptyMessage.textContent = 'No Bookmark';
 
     body.append(emptyMessage, bookmarkList);
     bookmarkWindow.append(header, body);
@@ -2016,8 +2016,8 @@
       const replyJumpButton = document.createElement('button');
       replyJumpButton.type = 'button';
       replyJumpButton.className = 'tm-bookmark-reply-jump';
-      replyJumpButton.title = '跳转到 Reply';
-      replyJumpButton.setAttribute('aria-label', '跳转到 Reply');
+      replyJumpButton.title = ' Jump to Reply';
+      replyJumpButton.setAttribute('aria-label', ' Jump to Reply');
       replyJumpButton.textContent = '↪';
       replyJumpButton.addEventListener('click', event => {
         event.stopPropagation();
@@ -2027,8 +2027,8 @@
       const deleteButton = document.createElement('button');
       deleteButton.type = 'button';
       deleteButton.className = 'tm-bookmark-delete';
-      deleteButton.title = '删除';
-      deleteButton.setAttribute('aria-label', '删除 Bookmark');
+      deleteButton.title = ' Delete';
+      deleteButton.setAttribute('aria-label', 'Delete Bookmark');
       deleteButton.textContent = '×';
 
       deleteButton.addEventListener('click', event => {
@@ -2051,7 +2051,7 @@
 
   function renameBookmark(bookmark) {
     const value = prompt(
-      '请输入 Bookmark 标题；留空则恢复为选中的原文：',
+      'Please enter the Bookmark title; leave empty to restore the selected text:',
       bookmark.title || bookmark.text
     );
 
@@ -2086,7 +2086,7 @@
 
     if (collapseButton) {
       collapseButton.textContent = collapsed ? '+' : '−';
-      collapseButton.title = collapsed ? '展开' : '折叠';
+      collapseButton.title = collapsed ? 'Expand' : 'Collapse';
     }
   }
 
@@ -2205,8 +2205,8 @@
         JSON.stringify(bookmarks)
       );
     } catch (error) {
-      console.error('[Text Bookmarks] 保存失败：', error);
-      showToast('Bookmark 保存失败');
+      console.error('[Text Bookmarks] Save failed:', error);
+      showToast('Bookmark save failed: localStorage error');
     }
   }
 
