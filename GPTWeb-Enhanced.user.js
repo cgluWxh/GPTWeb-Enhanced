@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.6.0
+// @version      0.6.2
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -38,6 +38,7 @@
 
   let highlightCleanupTimer = null;
   let autoExpandTimer = null;
+  const replyTurnMonitorTimers = new Set();
 
   init();
 
@@ -350,25 +351,29 @@
    * Bookmark creation
    */
 
-  function createBookmarkFromPendingSelection(replyContent = '') {
-    if (!pendingSelection) {
+  function createBookmarkFromPendingSelection(
+    replyContent = '',
+    selectionInfo = pendingSelection,
+    replyTurnID = null
+  ) {
+    if (!selectionInfo) {
       hideBookmarkButton();
       return false;
     }
 
     const existingIndex = bookmarks.findIndex(bookmark =>
-      isSameBookmarkLocation(bookmark, pendingSelection)
+      isSameBookmarkLocation(bookmark, selectionInfo)
     );
 
     if (existingIndex !== -1) {
       const [existingBookmark] = bookmarks.splice(existingIndex, 1);
       existingBookmark.createdAt = Date.now();
-      if (pendingSelection.turnID) {
-        existingBookmark.turnID = pendingSelection.turnID;
+      if (selectionInfo.turnID) {
+        existingBookmark.turnID = selectionInfo.turnID;
       }
       if (replyContent) {
         existingBookmark.replyContent = replyContent.trim();
-        existingBookmark.replyTurnID = null;
+        existingBookmark.replyTurnID = replyTurnID;
       }
       bookmarks.unshift(existingBookmark);
       saveBookmarks();
@@ -379,35 +384,38 @@
       setWindowCollapsed(false);
       flashWindow();
       showToast('已刷新 Bookmark');
-      return 'updated';
+      return {
+        status: 'updated',
+        bookmark: existingBookmark,
+      };
     }
 
     const bookmark = {
       id: crypto.randomUUID?.() ?? createFallbackId(),
       createdAt: Date.now(),
 
-      text: pendingSelection.text,
-      formulaLatex: pendingSelection.formulaLatex,
+      text: selectionInfo.text,
+      formulaLatex: selectionInfo.formulaLatex,
       replyContent: replyContent.trim() || null,
-      turnID: pendingSelection.turnID,
-      replyTurnID: null,
+      turnID: selectionInfo.turnID,
+      replyTurnID,
 
-      rootIndex: pendingSelection.rootIndex,
+      rootIndex: selectionInfo.rootIndex,
 
-      start: pendingSelection.start,
-      end: pendingSelection.end,
+      start: selectionInfo.start,
+      end: selectionInfo.end,
 
-      prefix: pendingSelection.prefix,
-      suffix: pendingSelection.suffix,
-      messageId: pendingSelection.messageId,
-      messageRole: pendingSelection.messageRole,
-      messageStart: pendingSelection.messageStart,
-      messageEnd: pendingSelection.messageEnd,
+      prefix: selectionInfo.prefix,
+      suffix: selectionInfo.suffix,
+      messageId: selectionInfo.messageId,
+      messageRole: selectionInfo.messageRole,
+      messageStart: selectionInfo.messageStart,
+      messageEnd: selectionInfo.messageEnd,
 
-      startPath: pendingSelection.startPath,
-      startOffset: pendingSelection.startOffset,
-      endPath: pendingSelection.endPath,
-      endOffset: pendingSelection.endOffset,
+      startPath: selectionInfo.startPath,
+      startOffset: selectionInfo.startOffset,
+      endPath: selectionInfo.endPath,
+      endOffset: selectionInfo.endOffset,
     };
 
     bookmarks.unshift(bookmark);
@@ -419,7 +427,10 @@
 
     setWindowCollapsed(false);
     flashWindow();
-    return 'added';
+    return {
+      status: 'added',
+      bookmark,
+    };
   }
 
   function isSameBookmarkLocation(bookmark, selectionInfo) {
@@ -590,38 +601,19 @@
       return false;
     }
 
-    const replyContent = normalizeText(bookmark.replyContent);
-    const messages = [
-      ...(searchRoot.matches?.(MESSAGE_SELECTOR) ? [searchRoot] : []),
-      ...searchRoot.querySelectorAll(MESSAGE_SELECTOR),
-    ];
-    const userMessages = messages.filter(
-      message =>
-        message.getAttribute('data-message-author-role') === 'user'
-    );
-    const candidates = userMessages.length ? userMessages : messages;
-    let targetMessage = null;
-    let targetRange = null;
+    const match = findReplyMatch(searchRoot, bookmark.replyContent);
 
-    for (let index = candidates.length - 1; index >= 0; index--) {
-      const message = candidates[index];
-      const range = locateByNormalizedText(message, {
-        text: replyContent,
-      });
-
-      if (range) {
-        targetMessage = message;
-        targetRange = range;
-        break;
-      }
-    }
-
-    if (!targetMessage || !targetRange) {
+    if (!match) {
       if (showFailure) {
         showToast('找不到对应的 Reply，消息可能尚未发送');
       }
       return false;
     }
+
+    const {
+      targetMessage,
+      targetRange,
+    } = match;
 
     backfillTurnID(bookmark, 'replyTurnID', targetMessage);
 
@@ -640,6 +632,40 @@
 
     highlightRange(targetRange);
     return true;
+  }
+
+  function findReplyMatch(searchRoot, replyContent) {
+    const normalizedReplyContent = normalizeText(replyContent);
+
+    if (!searchRoot || !normalizedReplyContent) {
+      return null;
+    }
+
+    const messages = [
+      ...(searchRoot.matches?.(MESSAGE_SELECTOR) ? [searchRoot] : []),
+      ...searchRoot.querySelectorAll(MESSAGE_SELECTOR),
+    ];
+    const userMessages = messages.filter(
+      message =>
+        message.getAttribute('data-message-author-role') === 'user'
+    );
+    const candidates = userMessages.length ? userMessages : messages;
+
+    for (let index = candidates.length - 1; index >= 0; index--) {
+      const message = candidates[index];
+      const range = locateByNormalizedText(message, {
+        text: normalizedReplyContent,
+      });
+
+      if (range) {
+        return {
+          targetMessage: message,
+          targetRange: range,
+        };
+      }
+    }
+
+    return null;
   }
 
   function findTurnContainer(turnID) {
@@ -672,6 +698,68 @@
 
     bookmark[field] = turnID;
     saveBookmarks();
+  }
+
+  function monitorPendingReply(selectionInfo, replyContent) {
+    const initialTurns = [...document.querySelectorAll(
+      'div[data-turn-id-container]'
+    )];
+    const initialTurnCount = initialTurns.length;
+    const initialTurnIDs = new Set(
+      initialTurns.map(turn =>
+        turn.getAttribute('data-turn-id-container')
+      )
+    );
+
+    const timer = setInterval(() => {
+      const currentTurnCount = document.querySelectorAll(
+        'div[data-turn-id-container]'
+      ).length;
+
+      if (currentTurnCount === initialTurnCount) {
+        return;
+      }
+
+      clearInterval(timer);
+      replyTurnMonitorTimers.delete(timer);
+
+      const newTurns = [...document.querySelectorAll(
+        'div[data-turn-id-container]'
+      )].filter(
+        turn =>
+          !initialTurnIDs.has(
+            turn.getAttribute('data-turn-id-container')
+          )
+      );
+      let replyTurnID = null;
+
+      for (let index = newTurns.length - 1; index >= 0; index--) {
+        if (findReplyMatch(newTurns[index], replyContent)) {
+          replyTurnID = newTurns[index].getAttribute(
+            'data-turn-id-container'
+          );
+          break;
+        }
+      }
+
+      if (replyTurnID) {
+        createBookmarkFromPendingSelection(
+          replyContent,
+          selectionInfo,
+          replyTurnID
+        );
+        showToast('Reply 已发送并添加 Bookmark');
+      }
+    }, 250);
+
+    replyTurnMonitorTimers.add(timer);
+  }
+
+  function clearReplyTurnMonitors() {
+    for (const timer of replyTurnMonitorTimers) {
+      clearInterval(timer);
+    }
+    replyTurnMonitorTimers.clear();
   }
 
   function locateBookmarkRange(scrollRoot, bookmark) {
@@ -1424,14 +1512,10 @@
       return;
     }
 
-    const bookmarkResult = createBookmarkFromPendingSelection(quote);
-    showToast(
-      bookmarkResult === 'added'
-        ? '已插入 Reply 并添加 Bookmark'
-        : bookmarkResult === 'updated'
-          ? '已插入 Reply 并刷新 Bookmark'
-          : '已插入 Reply'
-    );
+    hideBookmarkButton();
+    clearBrowserSelection();
+    monitorPendingReply(selectionInfo, quote);
+    showToast('已插入 Reply，发送后添加 Bookmark');
   }
 
   function getReplySelectionData(message, range) {
@@ -2106,6 +2190,7 @@
   function handleUrlChange() {
     clearTimeout(autoExpandTimer);
     autoExpandTimer = null;
+    clearReplyTurnMonitors();
 
     // history events may fire before location has settled in some frameworks.
     queueMicrotask(() => {
