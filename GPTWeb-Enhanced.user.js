@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.6.2
+// @version      0.6.4
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -9,6 +9,7 @@
 // @match        https://www.chatgpt.com/*
 // @grant        none
 // @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/cgluWxh/GPTWeb-Enhanced/main/GPTWeb-Enhanced.user.js
 // ==/UserScript==
 
 (() => {
@@ -257,8 +258,9 @@
     }
     const message = getParentElement(range.commonAncestorContainer)
       ?.closest(MESSAGE_SELECTOR);
-    const turnContainer = getParentElement(range.commonAncestorContainer)
-      ?.closest('[data-turn-id-container]');
+    const turnID = getValidTurnID(
+      getParentElement(range.commonAncestorContainer)
+    );
     const messageOffsets = message
       ? getCanonicalRangeOffsets(message, range)
       : null;
@@ -268,8 +270,7 @@
       scrollRoot,
       text: canonicalText,
       formulaLatex: formulaLatex || null,
-      turnID:
-        turnContainer?.getAttribute('data-turn-id-container') ?? null,
+      turnID,
       start,
       end,
       prefix: fullText.slice(
@@ -489,7 +490,9 @@
    */
 
   function jumpToBookmark(bookmark) {
-    if (bookmark.turnID) {
+    discardInvalidTurnID(bookmark, 'turnID');
+
+    if (isValidTurnID(bookmark.turnID)) {
       const turnContainer = findTurnContainer(bookmark.turnID);
 
       if (!turnContainer) {
@@ -567,7 +570,9 @@
       return;
     }
 
-    if (bookmark.replyTurnID) {
+    discardInvalidTurnID(bookmark, 'replyTurnID');
+
+    if (isValidTurnID(bookmark.replyTurnID)) {
       const turnContainer = findTurnContainer(bookmark.replyTurnID);
 
       if (!turnContainer) {
@@ -669,7 +674,7 @@
   }
 
   function findTurnContainer(turnID) {
-    if (!turnID) {
+    if (!isValidTurnID(turnID)) {
       return null;
     }
 
@@ -684,20 +689,55 @@
   }
 
   function backfillTurnID(bookmark, field, targetElement) {
-    if (bookmark[field]) {
+    if (isValidTurnID(bookmark[field])) {
       return;
     }
 
-    const turnID = targetElement
-      ?.closest('[data-turn-id-container]')
-      ?.getAttribute('data-turn-id-container');
+    const turnID = getValidTurnID(targetElement);
 
     if (!turnID) {
+      delete bookmark[field];
       return;
     }
 
     bookmark[field] = turnID;
     saveBookmarks();
+  }
+
+  function isValidTurnID(turnID) {
+    return (
+      typeof turnID === 'string' &&
+      turnID.length > 0 &&
+      !turnID.startsWith('request-WEB')
+    );
+  }
+
+  function discardInvalidTurnID(bookmark, field) {
+    if (bookmark[field] && !isValidTurnID(bookmark[field])) {
+      delete bookmark[field];
+      saveBookmarks();
+    }
+  }
+
+  function getValidTurnID(targetElement) {
+    let turnContainer =
+      targetElement?.closest('div[data-turn-id-container]') ?? null;
+
+    while (turnContainer) {
+      const turnID = turnContainer.getAttribute(
+        'data-turn-id-container'
+      );
+
+      if (isValidTurnID(turnID)) {
+        return turnID;
+      }
+
+      turnContainer = turnContainer.parentElement?.closest(
+        'div[data-turn-id-container]'
+      ) ?? null;
+    }
+
+    return null;
   }
 
   function monitorPendingReply(selectionInfo, replyContent) {
@@ -734,10 +774,10 @@
       let replyTurnID = null;
 
       for (let index = newTurns.length - 1; index >= 0; index--) {
-        if (findReplyMatch(newTurns[index], replyContent)) {
-          replyTurnID = newTurns[index].getAttribute(
-            'data-turn-id-container'
-          );
+        const match = findReplyMatch(newTurns[index], replyContent);
+
+        if (match) {
+          replyTurnID = getValidTurnID(match.targetMessage);
           break;
         }
       }
