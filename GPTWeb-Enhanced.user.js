@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.6.7
+// @version      0.6.8
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -1938,12 +1938,31 @@
       ) {
         exportBookmarkBackup();
       } else {
-        importBookmarkBackup();
+        showToast('Click the Import button to select a backup file');
       }
     });
 
     const controls = document.createElement('div');
     controls.className = 'tm-bookmark-controls';
+
+    const importLabel = document.createElement('label');
+    importLabel.className = 'tm-bookmark-import-button';
+    importLabel.textContent = 'Import';
+    importLabel.title = 'Import bookmark backup';
+
+    const importInput = document.createElement('input');
+    importInput.type = 'file';
+    importInput.accept = 'application/json,.json';
+    importInput.addEventListener('change', async () => {
+      const file = importInput.files?.[0];
+
+      if (file) {
+        await importBookmarkBackup(file);
+      }
+
+      importInput.value = '';
+    });
+    importLabel.appendChild(importInput);
 
     const collapseButton = document.createElement('button');
     collapseButton.type = 'button';
@@ -1958,7 +1977,7 @@
       setWindowCollapsed(!collapsed);
     });
 
-    controls.appendChild(collapseButton);
+    controls.append(importLabel, collapseButton);
     header.append(title, controls);
 
     const body = document.createElement('div');
@@ -2127,7 +2146,7 @@
         return;
       }
 
-      if (event.target.closest('button')) {
+      if (event.target.closest('button, label, input')) {
         return;
       }
 
@@ -2316,61 +2335,47 @@
     }
   }
 
-  function importBookmarkBackup() {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = 'application/json,.json';
+  async function importBookmarkBackup(file) {
+    try {
+      const backup = JSON.parse(await file.text());
 
-    input.addEventListener('change', async () => {
-      const file = input.files?.[0];
-
-      if (!file) {
-        return;
+      if (
+        backup?.format !== 'gptweb-enhanced-bookmarks' ||
+        !backup.bookmarks ||
+        typeof backup.bookmarks !== 'object' ||
+        Array.isArray(backup.bookmarks)
+      ) {
+        throw new Error('Invalid backup format');
       }
 
-      try {
-        const backup = JSON.parse(await file.text());
+      const entries = Object.entries(backup.bookmarks);
 
-        if (
-          backup?.format !== 'gptweb-enhanced-bookmarks' ||
-          !backup.bookmarks ||
-          typeof backup.bookmarks !== 'object' ||
-          Array.isArray(backup.bookmarks)
-        ) {
-          throw new Error('Invalid backup format');
-        }
-
-        const entries = Object.entries(backup.bookmarks);
-
-        if (
-          entries.some(
-            ([urlKey, value]) =>
-              !urlKey ||
-              !Array.isArray(value)
-          )
-        ) {
-          throw new Error('Invalid bookmark data');
-        }
-
-        for (const [urlKey, storedBookmarks] of entries) {
-          localStorage.setItem(
-            `${STORAGE_PREFIX}${urlKey}`,
-            JSON.stringify(storedBookmarks)
-          );
-        }
-
-        localStorage.setItem(DATA_VERSION_KEY, String(DATA_VERSION));
-        bookmarks = loadBookmarks(currentUrlKey);
-        renderBookmarks();
-        syncWindowCollapsedAfterUrlSettles();
-        showToast(`Imported ${entries.length} bookmark lists`);
-      } catch (error) {
-        console.error('[Text Bookmarks] Import failed:', error);
-        showToast('Bookmark backup import failed');
+      if (
+        entries.some(
+          ([urlKey, value]) =>
+            !urlKey ||
+            !Array.isArray(value)
+        )
+      ) {
+        throw new Error('Invalid bookmark data');
       }
-    }, { once: true });
 
-    input.click();
+      for (const [urlKey, storedBookmarks] of entries) {
+        localStorage.setItem(
+          `${STORAGE_PREFIX}${urlKey}`,
+          JSON.stringify(storedBookmarks)
+        );
+      }
+
+      localStorage.setItem(DATA_VERSION_KEY, String(DATA_VERSION));
+      bookmarks = loadBookmarks(currentUrlKey);
+      renderBookmarks();
+      syncWindowCollapsedAfterUrlSettles();
+      showToast(`Imported ${entries.length} bookmark lists`);
+    } catch (error) {
+      console.error('[Text Bookmarks] Import failed:', error);
+      showToast('Bookmark backup import failed');
+    }
   }
 
   function getStorageKey(urlKey = currentUrlKey) {
@@ -2628,6 +2633,32 @@
         display: flex;
         align-items: center;
         gap: 4px;
+      }
+
+      .tm-bookmark-import-button {
+        all: unset;
+        box-sizing: border-box;
+        padding: 6px 8px;
+        border-radius: 7px;
+        color: inherit;
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 15px;
+        cursor: pointer;
+      }
+
+      .tm-bookmark-import-button:hover {
+        background: rgba(127, 127, 127, 0.14);
+      }
+
+      .tm-bookmark-import-button > input {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0 0 0 0);
+        clip-path: inset(50%);
+        white-space: nowrap;
       }
 
       .tm-bookmark-icon-button {
