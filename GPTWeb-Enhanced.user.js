@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.6.5
+// @version      0.6.6
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -17,6 +17,8 @@
 
   const SCROLL_ROOT_SELECTOR = 'div[data-scroll-root]';
   const STORAGE_PREFIX = 'tm-text-bookmarks:';
+  const DATA_VERSION_KEY = `${STORAGE_PREFIX}data-version`;
+  const DATA_VERSION = 1;
   const MESSAGE_SELECTOR = '[data-message-id]';
   const IGNORED_TEXT_SELECTOR = [
     'script', 'style', 'noscript', 'textarea', 'input', 'select',
@@ -27,6 +29,8 @@
 
   const MAX_TITLE_LENGTH = 100;
   const CONTEXT_LENGTH = 80;
+
+  migrateBookmarkData();
 
   let currentUrlKey = getUrlKey();
   let bookmarks = loadBookmarks(currentUrlKey);
@@ -2160,8 +2164,91 @@
    */
 
   function getUrlKey() {
-    // Include query/hash as requested: every distinct address owns its list.
-    return `${location.origin}${location.pathname}${location.search}${location.hash}`;
+    return getLastPathPart(location.pathname);
+  }
+
+  function getLastPathPart(pathOrUrl) {
+    try {
+      const pathname = new URL(pathOrUrl, location.origin).pathname;
+      return pathname.split('/').filter(Boolean).at(-1) ?? '';
+    } catch {
+      return String(pathOrUrl ?? '')
+        .split(/[?#]/, 1)[0]
+        .split('/')
+        .filter(Boolean)
+        .at(-1) ?? '';
+    }
+  }
+
+  function migrateBookmarkData() {
+    const storedVersion =
+      Number.parseInt(localStorage.getItem(DATA_VERSION_KEY), 10) || 0;
+
+    if (storedVersion >= DATA_VERSION) {
+      return;
+    }
+
+    try {
+      const sourceKeys = [];
+      const mergedByUrlKey = new Map();
+
+      for (let index = 0; index < localStorage.length; index++) {
+        const storageKey = localStorage.key(index);
+
+        if (
+          !storageKey?.startsWith(STORAGE_PREFIX) ||
+          storageKey === DATA_VERSION_KEY
+        ) {
+          continue;
+        }
+
+        const oldUrlKey = storageKey.slice(STORAGE_PREFIX.length);
+        const newUrlKey = getLastPathPart(oldUrlKey);
+
+        if (!newUrlKey) {
+          continue;
+        }
+
+        let storedBookmarks;
+
+        try {
+          storedBookmarks = JSON.parse(localStorage.getItem(storageKey));
+        } catch {
+          continue;
+        }
+
+        if (!Array.isArray(storedBookmarks)) {
+          continue;
+        }
+
+        sourceKeys.push(storageKey);
+
+        const mergedBookmarks = mergedByUrlKey.get(newUrlKey) ?? [];
+        mergedBookmarks.push(...storedBookmarks);
+        mergedByUrlKey.set(newUrlKey, mergedBookmarks);
+      }
+
+      const destinationKeys = new Set();
+
+      for (const [urlKey, mergedBookmarks] of mergedByUrlKey) {
+        const destinationKey = `${STORAGE_PREFIX}${urlKey}`;
+        destinationKeys.add(destinationKey);
+        localStorage.setItem(
+          destinationKey,
+          JSON.stringify(mergedBookmarks)
+        );
+      }
+
+      for (const sourceKey of sourceKeys) {
+        if (!destinationKeys.has(sourceKey)) {
+          localStorage.removeItem(sourceKey);
+        }
+      }
+
+      localStorage.setItem(DATA_VERSION_KEY, String(DATA_VERSION));
+    } catch (error) {
+      console.error('[Text Bookmarks] Migration failed:', error);
+    }
   }
 
   function getStorageKey(urlKey = currentUrlKey) {
