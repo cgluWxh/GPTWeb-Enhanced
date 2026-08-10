@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.6.8
+// @version      0.7.0
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -14,6 +14,18 @@
 
 (() => {
   'use strict';
+
+  const appendCss = (css) => {
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
+  };
+
+  appendCss(`
+    div.\\[position-visibility\\:anchors-visible\\][popover] {
+      display: none !important;
+    }
+  `);
 
   const SCROLL_ROOT_SELECTOR = 'div[data-scroll-root]';
   const STORAGE_PREFIX = 'tm-text-bookmarks:';
@@ -56,7 +68,7 @@
     document.addEventListener('keyup', handleKeyboardSelection, true);
     document.addEventListener('mousedown', handleDocumentMouseDown, true);
     document.addEventListener('selectionchange', handleSelectionChange);
-    document.addEventListener('copy', handleGlobalCopy, true);
+    // document.addEventListener('copy', handleGlobalCopy, true);
     installUrlChangeListener();
 
     renderBookmarks();
@@ -331,8 +343,8 @@
 
   function getKatexLatex(element) {
     return element
-      .querySelector('annotation[encoding="application/x-tex"]')
-      ?.textContent
+      .closest('[data-math-source]')
+      ?.getAttribute('data-math-source')
       ?.trim() ?? '';
   }
 
@@ -1727,8 +1739,9 @@
     // block, otherwise a partial code/formula selection would become plain text.
     if (startFormula && startFormula === endFormula) {
       const tex = startFormula
-        .querySelector('annotation[encoding="application/x-tex"]')
-        ?.textContent?.trim();
+        .closest('[data-math-source]')
+        ?.getAttribute('data-math-source')
+        ?.trim() ?? '';
       if (tex) return `$${tex.replace(/\$/g, '\\$')}$`;
     }
 
@@ -1764,8 +1777,9 @@
 
       if (element.matches('.katex-display, .katex')) {
         const tex = element
-          .querySelector('annotation[encoding="application/x-tex"]')
-          ?.textContent?.trim();
+          .closest('[data-math-source]')
+          ?.getAttribute('data-math-source')
+          ?.trim() ?? '';
 
         if (tex) {
           const formula = `$${tex.replace(/\$/g, '\\$')}$`;
