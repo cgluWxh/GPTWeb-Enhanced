@@ -1,14 +1,16 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      0.7.0
+// @version      1.0.0
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
 // @match        https://chatgpt.com/*
 // @match        https://www.chatgpt.com/*
-// @grant        none
+// @grant        GM_xmlhttpRequest
 // @run-at       document-idle
+// @connect      app.831.moe
+// @require      https://app.831.moe/console/moengine-sdk.global.js
 // @updateURL    https://raw.githubusercontent.com/cgluWxh/GPTWeb-Enhanced/main/GPTWeb-Enhanced.user.js
 // ==/UserScript==
 
@@ -42,10 +44,22 @@
   const MAX_TITLE_LENGTH = 100;
   const CONTEXT_LENGTH = 80;
 
+  // Cloud sync (MoEngine). Set CLOUD_BASE_URL to your engine's public origin.
+  // The engine must be reachable with the same scheme as this page (https).
+  const CLOUD_BASE_URL = 'https://app.831.moe';
+  const CLOUD_APP_ID = 'gptweb';
+  const CLOUD_TOKEN_KEY = 'tm-bookmarks:cloud:token';
+  const CLOUD_COLLECTION = 'bookmarks';
+  const CLOUD_DB_NAME = 'moengine-gptweb';
+
+  let cloudClient = null;
+  let cloudKv = null;
+  let bookmarkImportInput = null;
+
   migrateBookmarkData();
 
   let currentUrlKey = getUrlKey();
-  let bookmarks = loadBookmarks(currentUrlKey);
+  let bookmarks = [];
   let pendingSelection = null;
 
   let bookmarkButton = null;
@@ -73,6 +87,270 @@
 
     renderBookmarks();
     syncWindowCollapsedAfterUrlSettles();
+    void refreshBookmarks(currentUrlKey);
+  }
+
+  /**
+   * Cloud sync / MoEngine adapter
+   */
+
+  function isCloudLoggedIn() {
+    return Boolean(localStorage.getItem(CLOUD_TOKEN_KEY));
+  }
+
+  function getCloudClient() {
+    if (typeof MoEngine === 'undefined') {
+      throw new Error('MoEngine SDK not loaded');
+    }
+    if (cloudClient === null) {
+      const gmFetch =
+        typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function'
+          ? MoEngine.createGmFetch(details => GM.xmlHttpRequest(details))
+          : undefined;
+      cloudClient = MoEngine.createMoEngineClient({
+        baseUrl: CLOUD_BASE_URL,
+        appId: CLOUD_APP_ID,
+        accessToken: () => localStorage.getItem(CLOUD_TOKEN_KEY),
+        ...(gmFetch ? { fetch: gmFetch } : {}),
+      });
+    }
+    return cloudClient;
+  }
+
+  async function ensureCloudKv() {
+    if (cloudKv !== null) return cloudKv;
+    const client = getCloudClient();
+    cloudKv = await client.openKv({
+      collection: CLOUD_COLLECTION,
+      storage: new MoEngine.IndexedDbKvStorage({
+        dbName: CLOUD_DB_NAME,
+        storeName: CLOUD_COLLECTION,
+      }),
+    });
+    return cloudKv;
+  }
+
+  async function cloudLoad(urlKey) {
+    const kv = await ensureCloudKv();
+    const value = await kv.getItem(urlKey);
+    return Array.isArray(value) ? value : [];
+  }
+
+  async function cloudSave(urlKey, storedBookmarks) {
+    const kv = await ensureCloudKv();
+    await kv.setItem(urlKey, storedBookmarks);
+  }
+
+  async function loadBookmarks(urlKey = currentUrlKey) {
+    if (isCloudLoggedIn()) {
+      try {
+        const cloud = await cloudLoad(urlKey);
+        return Array.isArray(cloud) ? cloud : [];
+      } catch (error) {
+        console.error('[Text Bookmarks] Cloud load failed, falling back to local:', error);
+      }
+    }
+    try {
+      const parsed = JSON.parse(localStorage.getItem(getStorageKey(urlKey)));
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  async function saveBookmarks() {
+    try {
+      if (isCloudLoggedIn()) {
+        await cloudSave(currentUrlKey, bookmarks);
+        return;
+      }
+      localStorage.setItem(getStorageKey(), JSON.stringify(bookmarks));
+    } catch (error) {
+      console.error('[Text Bookmarks] Save failed:', error);
+      showToast('Bookmark save failed');
+    }
+  }
+
+  async function refreshBookmarks(urlKey) {
+    bookmarks = await loadBookmarks(urlKey);
+    renderBookmarks();
+    syncWindowCollapsedAfterUrlSettles();
+  }
+
+  async function ssoLogin() {
+    if (typeof MoEngine === 'undefined') {
+      showToast('MoEngine SDK is not loaded');
+      return;
+    }
+    const client = getCloudClient();
+    const state = crypto.randomUUID();
+    const engineOrigin = new URL(CLOUD_BASE_URL).origin;
+    // 回调落在引擎自带的固定中继页（全局窄放行），页面把 code/state 经
+    // postMessage 交回主窗口；主窗口再用 GM 运输层做 exchange，避免被
+    // ChatGPT SPA 清参、也绕开页面 CORS/混合内容。
+    const callbackUrl = `${engineOrigin}/console/sso-callback.html`;
+    const ssoUrl = client.auth.buildSsoLoginUrl(callbackUrl, state);
+    const popup = window.open(ssoUrl, 'moengine-sso', 'width=460,height=640');
+
+    if (!popup) {
+      showToast('Popup blocked: allow popups for SSO login');
+      return;
+    }
+
+    const result = await new Promise(resolve => {
+      const deadline = Date.now() + 120000;
+      const onMessage = event => {
+        const data = event.data;
+
+        if (
+          data &&
+          data.type === 'moengine:sso' &&
+          data.state === state &&
+          event.origin === engineOrigin
+        ) {
+          window.removeEventListener('message', onMessage);
+          resolve(data);
+        }
+      };
+      window.addEventListener('message', onMessage);
+
+      const poll = setInterval(() => {
+        if (popup.closed || Date.now() > deadline) {
+          clearInterval(poll);
+          window.removeEventListener('message', onMessage);
+          resolve(null);
+        }
+      }, 500);
+    });
+
+    if (!popup.closed) popup.close();
+
+    if (!result || !result.code) {
+      showToast('SSO login cancelled or timed out');
+      return;
+    }
+
+    try {
+      const grant = await client.auth.exchange({
+        code: result.code,
+        callbackUrl,
+        deviceName: 'GPTWebEnhanced',
+      });
+      localStorage.setItem(CLOUD_TOKEN_KEY, grant.access_token);
+      client.setAccessToken(() => grant.access_token);
+      await migrateLocalToCloud();
+      await refreshBookmarks(currentUrlKey);
+      showToast('Logged in & synced to cloud');
+    } catch (error) {
+      console.error('[Text Bookmarks] SSO exchange or cloud sync failed:', error);
+      showToast(`SSO login failed: ${error?.message || 'exchange error'}`);
+    }
+  }
+
+  async function cloudLogout() {
+    const client = cloudClient;
+    if (client && isCloudLoggedIn()) {
+      try {
+        await client.auth.logout();
+      } catch {
+        // Best-effort; token is revoked locally regardless.
+      }
+    }
+    localStorage.removeItem(CLOUD_TOKEN_KEY);
+    cloudClient = null;
+    cloudKv = null;
+    await refreshBookmarks(currentUrlKey);
+    showToast('Logged out, using local storage');
+  }
+
+  async function migrateLocalToCloud() {
+    const entries = [];
+
+    for (let index = 0; index < localStorage.length; index++) {
+      const storageKey = localStorage.key(index);
+
+      if (
+        !storageKey?.startsWith(STORAGE_PREFIX) ||
+        storageKey === DATA_VERSION_KEY
+      ) {
+        continue;
+      }
+
+      const urlKey = storageKey.slice(STORAGE_PREFIX.length);
+
+      if (!urlKey) continue;
+
+      let storedBookmarks;
+
+      try {
+        storedBookmarks = JSON.parse(localStorage.getItem(storageKey));
+      } catch {
+        continue;
+      }
+
+      if (Array.isArray(storedBookmarks) && storedBookmarks.length) {
+        entries.push([urlKey, storedBookmarks]);
+      }
+    }
+
+    for (const [urlKey, storedBookmarks] of entries) {
+      await cloudSave(urlKey, storedBookmarks);
+    }
+
+    if (entries.length) {
+      showToast(`Uploaded ${entries.length} bookmark lists to cloud`);
+    }
+  }
+
+  function showCloudMenu(x, y) {
+    removeCloudMenu();
+
+    const loggedIn = isCloudLoggedIn();
+    const menu = document.createElement('div');
+    menu.id = 'tm-cloud-menu';
+
+    const addItem = (label, fn) => {
+      const item = document.createElement('button');
+      item.type = 'button';
+      item.textContent = label;
+      item.addEventListener('click', () => {
+        removeCloudMenu();
+        void fn();
+      });
+      menu.appendChild(item);
+      return item;
+    };
+
+    const authLabel = loggedIn
+      ? 'Cloud Sync: Logout'
+      : `Cloud Sync: SSO Login (${CLOUD_BASE_URL})`;
+    addItem(authLabel, async () => {
+      if (loggedIn) {
+        await cloudLogout();
+      } else {
+        await ssoLogin();
+      }
+    });
+    addItem('Export backup', exportBookmarkBackup);
+    addItem('Import backup', () => bookmarkImportInput?.click());
+
+    menu.style.left = `${Math.max(8, Math.min(x, window.innerWidth - 180))}px`;
+    menu.style.top = `${Math.max(8, Math.min(y, window.innerHeight - 140))}px`;
+    document.documentElement.appendChild(menu);
+
+    const closeOnOutside = event => {
+      if (!menu.contains(event.target)) {
+        removeCloudMenu();
+        document.removeEventListener('mousedown', closeOnOutside);
+      }
+    };
+    setTimeout(() => {
+      document.addEventListener('mousedown', closeOnOutside);
+    }, 0);
+  }
+
+  function removeCloudMenu() {
+    document.querySelector('#tm-cloud-menu')?.remove();
   }
 
   /**
@@ -1941,32 +2219,26 @@
     const title = document.createElement('div');
     title.className = 'tm-bookmark-title';
     title.textContent = 'Bookmarks';
-    title.title = 'Right-click to export or import backups';
+    title.title = 'Right-click: cloud sync / export / import';
     title.addEventListener('contextmenu', event => {
       event.preventDefault();
-
-      if (
-        confirm(
-          'OK: Export bookmark backup\nCancel: Import bookmark backup'
-        )
-      ) {
-        exportBookmarkBackup();
-      } else {
-        showToast('Click the Import button to select a backup file');
-      }
+      showCloudMenu(event.clientX, event.clientY);
     });
 
     const controls = document.createElement('div');
     controls.className = 'tm-bookmark-controls';
 
-    const importLabel = document.createElement('label');
-    importLabel.className = 'tm-bookmark-import-button';
-    importLabel.textContent = 'Import';
-    importLabel.title = 'Import bookmark backup';
-
     const importInput = document.createElement('input');
     importInput.type = 'file';
     importInput.accept = 'application/json,.json';
+    importInput.style.position = 'fixed';
+    importInput.style.width = '1px';
+    importInput.style.height = '1px';
+    importInput.style.overflow = 'hidden';
+    importInput.style.clip = 'rect(0 0 0 0)';
+    importInput.style.clipPath = 'inset(50%)';
+    importInput.style.whiteSpace = 'nowrap';
+    bookmarkImportInput = importInput;
     importInput.addEventListener('change', async () => {
       const file = importInput.files?.[0];
 
@@ -1976,7 +2248,7 @@
 
       importInput.value = '';
     });
-    importLabel.appendChild(importInput);
+    document.documentElement.appendChild(importInput);
 
     const collapseButton = document.createElement('button');
     collapseButton.type = 'button';
@@ -1991,7 +2263,7 @@
       setWindowCollapsed(!collapsed);
     });
 
-    controls.append(importLabel, collapseButton);
+    controls.append(collapseButton);
     header.append(title, controls);
 
     const body = document.createElement('div');
@@ -2175,7 +2447,6 @@
       windowElement.style.left = `${rect.left}px`;
       windowElement.style.top = `${rect.top}px`;
 
-      handle.setPointerCapture?.(event.pointerId);
       event.preventDefault();
     });
 
@@ -2375,16 +2646,18 @@
       }
 
       for (const [urlKey, storedBookmarks] of entries) {
-        localStorage.setItem(
-          `${STORAGE_PREFIX}${urlKey}`,
-          JSON.stringify(storedBookmarks)
-        );
+        if (isCloudLoggedIn()) {
+          await cloudSave(urlKey, storedBookmarks);
+        } else {
+          localStorage.setItem(
+            `${STORAGE_PREFIX}${urlKey}`,
+            JSON.stringify(storedBookmarks)
+          );
+        }
       }
 
       localStorage.setItem(DATA_VERSION_KEY, String(DATA_VERSION));
-      bookmarks = loadBookmarks(currentUrlKey);
-      renderBookmarks();
-      syncWindowCollapsedAfterUrlSettles();
+      await refreshBookmarks(currentUrlKey);
       showToast(`Imported ${entries.length} bookmark lists`);
     } catch (error) {
       console.error('[Text Bookmarks] Import failed:', error);
@@ -2394,28 +2667,6 @@
 
   function getStorageKey(urlKey = currentUrlKey) {
     return `${STORAGE_PREFIX}${urlKey}`;
-  }
-
-  function loadBookmarks(urlKey = currentUrlKey) {
-    try {
-      const parsed = JSON.parse(localStorage.getItem(getStorageKey(urlKey)));
-
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
-
-  function saveBookmarks() {
-    try {
-      localStorage.setItem(
-        getStorageKey(),
-        JSON.stringify(bookmarks)
-      );
-    } catch (error) {
-      console.error('[Text Bookmarks] Save failed:', error);
-      showToast('Bookmark save failed: localStorage error');
-    }
   }
 
   function installUrlChangeListener() {
@@ -2452,9 +2703,7 @@
       hideBookmarkButton();
       clearCurrentHighlight();
       currentUrlKey = nextUrlKey;
-      bookmarks = loadBookmarks(currentUrlKey);
-      renderBookmarks();
-      syncWindowCollapsedAfterUrlSettles();
+      void refreshBookmarks(currentUrlKey);
     });
   }
 
@@ -2649,32 +2898,6 @@
         gap: 4px;
       }
 
-      .tm-bookmark-import-button {
-        all: unset;
-        box-sizing: border-box;
-        padding: 6px 8px;
-        border-radius: 7px;
-        color: inherit;
-        font-size: 11px;
-        font-weight: 600;
-        line-height: 15px;
-        cursor: pointer;
-      }
-
-      .tm-bookmark-import-button:hover {
-        background: rgba(127, 127, 127, 0.14);
-      }
-
-      .tm-bookmark-import-button > input {
-        position: absolute;
-        width: 1px;
-        height: 1px;
-        overflow: hidden;
-        clip: rect(0 0 0 0);
-        clip-path: inset(50%);
-        white-space: nowrap;
-      }
-
       .tm-bookmark-icon-button {
         all: unset;
         display: grid;
@@ -2840,6 +3063,49 @@
         }
       }
 
+      #tm-cloud-menu {
+        all: initial;
+        position: fixed;
+        z-index: 2147483647;
+        display: flex;
+        min-width: 168px;
+        flex-direction: column;
+        box-sizing: border-box;
+        padding: 5px;
+        border: 1px solid rgba(127, 127, 127, 0.3);
+        border-radius: 10px;
+        background: rgba(248, 248, 250, 0.97);
+        box-shadow: 0 12px 38px rgba(0, 0, 0, 0.24);
+        font-family:
+          system-ui,
+          -apple-system,
+          BlinkMacSystemFont,
+          "Segoe UI",
+          sans-serif;
+        backdrop-filter: blur(14px);
+      }
+
+      #tm-cloud-menu > button {
+        all: unset;
+        box-sizing: border-box;
+        padding: 7px 10px;
+        border-radius: 7px;
+        color: #1d1d1f;
+        font-size: 12px;
+        font-weight: 500;
+        line-height: 1.3;
+        text-align: left;
+        cursor: pointer;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      #tm-cloud-menu > button:hover {
+        background: rgba(37, 99, 235, 0.12);
+        color: rgb(37, 99, 235);
+      }
+
       @media (prefers-color-scheme: dark) {
         #tm-bookmark-window {
           border-color: rgba(255, 255, 255, 0.14);
@@ -2865,6 +3131,20 @@
         .tm-bookmark-delete:hover {
           background: rgba(255, 70, 70, 0.15);
           color: rgb(255, 115, 115);
+        }
+
+        #tm-cloud-menu {
+          border-color: rgba(255, 255, 255, 0.16);
+          background: rgba(31, 31, 34, 0.97);
+        }
+
+        #tm-cloud-menu > button {
+          color: rgba(255, 255, 255, 0.92);
+        }
+
+        #tm-cloud-menu > button:hover {
+          background: rgba(79, 140, 255, 0.22);
+          color: rgb(140, 175, 255);
         }
       }
     `;
