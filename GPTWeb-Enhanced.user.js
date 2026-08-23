@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      1.0.0
+// @version      1.0.1
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -87,7 +87,7 @@
 
     renderBookmarks();
     syncWindowCollapsedAfterUrlSettles();
-    void refreshBookmarks(currentUrlKey);
+    void initializeBookmarks();
   }
 
   /**
@@ -177,6 +177,28 @@
     syncWindowCollapsedAfterUrlSettles();
   }
 
+  async function initializeBookmarks() {
+    if (!isCloudLoggedIn()) {
+      await refreshBookmarks(currentUrlKey);
+      return;
+    }
+
+    try {
+      await getCloudClient().auth.me();
+      await refreshBookmarks(currentUrlKey);
+    } catch (error) {
+      if (error?.status === 401) {
+        localStorage.removeItem(CLOUD_TOKEN_KEY);
+        cloudClient = null;
+        cloudKv = null;
+        showToast('Cloud login expired. Please log in again.');
+        return;
+      }
+      console.error('[Text Bookmarks] Cloud login check failed:', error);
+      showToast('Unable to verify cloud login');
+    }
+  }
+
   async function ssoLogin() {
     if (typeof MoEngine === 'undefined') {
       showToast('MoEngine SDK is not loaded');
@@ -237,7 +259,8 @@
         deviceName: 'GPTWebEnhanced',
       });
       localStorage.setItem(CLOUD_TOKEN_KEY, grant.access_token);
-      client.setAccessToken(() => grant.access_token);
+      cloudClient = null;
+      cloudKv = null;
       await migrateLocalToCloud();
       await refreshBookmarks(currentUrlKey);
       showToast('Logged in & synced to cloud');
