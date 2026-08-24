@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      1.1.1
+// @version      1.1.2
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -21,7 +21,6 @@
   const interceptedChatGptAuth = {
     token: '',
     accountId: '',
-    projectId: '',
   };
 
   installChatGptFetchInterceptor();
@@ -94,7 +93,6 @@
 
     const authorization = readHeaderValue(headers, 'authorization');
     const accountId = readHeaderValue(headers, 'chatgpt-account-id');
-    const projectId = readHeaderValue(headers, 'chatgpt-project-id');
     let captured = false;
 
     if (/^Bearer\s+\S+/i.test(authorization)) {
@@ -108,11 +106,6 @@
       interceptedChatGptAuth.accountId = accountId;
       captured = true;
     }
-    if (projectId) {
-      interceptedChatGptAuth.projectId = projectId;
-      captured = true;
-    }
-
     if (captured && !interceptedChatGptAuth.reported) {
       interceptedChatGptAuth.reported = true;
       console.debug('[Text Bookmarks] Captured ChatGPT request authentication');
@@ -1331,8 +1324,6 @@
         )}&include_has_versions=true&num_turns=${CONVERSATION_PAGE_SIZE}`
       : `${base}?include_has_versions=true&num_turns=${CONVERSATION_PAGE_SIZE}`;
     const session = await waitForChatGptRequestAuth();
-    const projectId = session.projectId || getChatGptProjectId();
-
     if (!session.token) {
       throw new Error(
         'ChatGPT request token has not been captured; reload the page and try again'
@@ -1347,9 +1338,6 @@
           : {}),
         ...(session.accountId
           ? { 'chatgpt-account-id': session.accountId }
-          : {}),
-        ...(projectId
-          ? { 'chatgpt-project-id': projectId }
           : {}),
       },
     });
@@ -3205,14 +3193,6 @@
     const conversationMarker = parts.lastIndexOf('c');
     return conversationMarker !== -1
       ? parts[conversationMarker + 1] || ''
-      : '';
-  }
-
-  function getChatGptProjectId() {
-    const parts = location.pathname.split('/').filter(Boolean);
-    const projectMarker = parts.lastIndexOf('g');
-    return projectMarker !== -1
-      ? parts[projectMarker + 1] || ''
       : '';
   }
 
