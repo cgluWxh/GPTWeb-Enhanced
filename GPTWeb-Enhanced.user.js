@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      1.0.1
+// @version      1.1.1
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
 // @match        https://chatgpt.com/*
 // @match        https://www.chatgpt.com/*
 // @grant        GM_xmlhttpRequest
-// @run-at       document-idle
+// @grant        unsafeWindow
+// @run-at       document-start
 // @connect      app.831.moe
 // @require      https://app.831.moe/console/moengine-sdk.global.js
 // @updateURL    https://raw.githubusercontent.com/cgluWxh/GPTWeb-Enhanced/main/GPTWeb-Enhanced.user.js
@@ -17,10 +18,23 @@
 (() => {
   'use strict';
 
+  const interceptedChatGptAuth = {
+    token: '',
+    accountId: '',
+    projectId: '',
+  };
+
+  installChatGptFetchInterceptor();
+  const fetchInterceptorGuard = setInterval(
+    installChatGptFetchInterceptor,
+    1000
+  );
+  setTimeout(() => clearInterval(fetchInterceptorGuard), 30000);
+
   const appendCss = (css) => {
     const style = document.createElement('style');
     style.textContent = css;
-    document.head.appendChild(style);
+    (document.head || document.documentElement).appendChild(style);
   };
 
   appendCss(`
@@ -29,11 +43,118 @@
     }
   `);
 
+  function installChatGptFetchInterceptor() {
+    const pageWindow =
+      typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    const nativeFetch = pageWindow.fetch;
+
+    if (
+      typeof nativeFetch !== 'function' ||
+      nativeFetch.__tmBookmarkAuthInterceptor
+    ) {
+      return;
+    }
+
+    const wrappedFetch = function (input, init) {
+      try {
+        const rawUrl =
+          typeof input === 'string' || input instanceof URL
+            ? String(input)
+            : input?.url || '';
+        const url = new URL(rawUrl, location.origin);
+
+        if (
+          url.origin === location.origin &&
+          url.pathname.startsWith('/backend-api/')
+        ) {
+          captureChatGptAuthHeaders(input?.headers);
+          captureChatGptAuthHeaders(init?.headers);
+        }
+      } catch {
+        // Authentication capture must never interfere with ChatGPT requests.
+      }
+
+      return nativeFetch.apply(this, arguments);
+    };
+
+    try {
+      Object.defineProperty(wrappedFetch, '__tmBookmarkAuthInterceptor', {
+        value: true,
+      });
+      Object.defineProperty(wrappedFetch, 'name', { value: 'fetch' });
+      wrappedFetch.toString = nativeFetch.toString.bind(nativeFetch);
+      pageWindow.fetch = wrappedFetch;
+    } catch (error) {
+      console.debug('[Text Bookmarks] Unable to wrap page fetch:', error);
+    }
+  }
+
+  function captureChatGptAuthHeaders(headers) {
+    if (!headers) return;
+
+    const authorization = readHeaderValue(headers, 'authorization');
+    const accountId = readHeaderValue(headers, 'chatgpt-account-id');
+    const projectId = readHeaderValue(headers, 'chatgpt-project-id');
+    let captured = false;
+
+    if (/^Bearer\s+\S+/i.test(authorization)) {
+      interceptedChatGptAuth.token = authorization.replace(
+        /^Bearer\s+/i,
+        ''
+      );
+      captured = true;
+    }
+    if (accountId) {
+      interceptedChatGptAuth.accountId = accountId;
+      captured = true;
+    }
+    if (projectId) {
+      interceptedChatGptAuth.projectId = projectId;
+      captured = true;
+    }
+
+    if (captured && !interceptedChatGptAuth.reported) {
+      interceptedChatGptAuth.reported = true;
+      console.debug('[Text Bookmarks] Captured ChatGPT request authentication');
+    }
+  }
+
+  function readHeaderValue(headers, name) {
+    try {
+      if (typeof headers.get === 'function') {
+        return headers.get(name) || '';
+      }
+
+      if (Array.isArray(headers)) {
+        const entry = headers.find(
+          item =>
+            Array.isArray(item) &&
+            String(item[0]).toLowerCase() === name
+        );
+        return entry ? String(entry[1]) : '';
+      }
+
+      for (const [key, value] of Object.entries(headers)) {
+        if (key.toLowerCase() === name) return String(value);
+      }
+    } catch {
+      // Cross-realm Request/Headers objects can occasionally reject access.
+    }
+
+    return '';
+  }
+
   const SCROLL_ROOT_SELECTOR = 'div[data-scroll-root]';
   const STORAGE_PREFIX = 'tm-text-bookmarks:';
   const DATA_VERSION_KEY = `${STORAGE_PREFIX}data-version`;
-  const DATA_VERSION = 1;
+  const DATA_VERSION = 2;
   const MESSAGE_SELECTOR = '[data-message-id]';
+  const TURN_CONTAINER_SELECTOR =
+    'div[data-turn-id-container]:not([data-turn-id-container="client-created-root"])';
+  const CONVERSATION_PAGE_SIZE = 10;
+  const MAX_CONVERSATION_PAGES = 50;
+  const DOM_PAGE_LOAD_TIMEOUT = 5000;
+  const MESSAGE_MOUNT_TIMEOUT = 5000;
   const IGNORED_TEXT_SELECTOR = [
     'script', 'style', 'noscript', 'textarea', 'input', 'select',
     'button', 'svg', '[aria-hidden="true"]', '.select-none',
@@ -70,6 +191,7 @@
   let highlightCleanupTimer = null;
   let autoExpandTimer = null;
   const replyTurnMonitorTimers = new Set();
+  const conversationApiCache = new Map();
 
   init();
 
@@ -578,6 +700,8 @@
     const turnID = getTurnIndex(
       getParentElement(range.commonAncestorContainer)
     );
+    const turnContainer = getParentElement(range.commonAncestorContainer)
+      ?.closest(TURN_CONTAINER_SELECTOR);
     const messageOffsets = message
       ? getCanonicalRangeOffsets(message, range)
       : null;
@@ -601,6 +725,9 @@
       rootIndex: getScrollRootIndex(scrollRoot),
       messageId: message?.getAttribute('data-message-id') ?? null,
       messageRole: message?.getAttribute('data-message-author-role') ?? null,
+      conversationId: getConversationId(),
+      turnContainerId:
+        turnContainer?.getAttribute('data-turn-id-container') ?? null,
       messageStart: messageOffsets?.start ?? null,
       messageEnd: messageOffsets?.end ?? null,
       startPath: getNodePath(scrollRoot, range.startContainer),
@@ -689,12 +816,14 @@
       if (isValidTurnID(selectionInfo.turnID)) {
         existingBookmark.turnID = selectionInfo.turnID;
       }
+      backfillSelectionLocator(existingBookmark, selectionInfo);
       if (replyContent) {
         existingBookmark.replyContent = replyContent.trim();
-        existingBookmark.replyTurnID = replyTurnID;
+        applyReplyLocator(existingBookmark, replyTurnID);
       }
       bookmarks.unshift(existingBookmark);
       saveBookmarks();
+      void enrichBookmarkLocators(existingBookmark);
       renderBookmarks();
 
       hideBookmarkButton();
@@ -711,12 +840,15 @@
     const bookmark = {
       id: crypto.randomUUID?.() ?? createFallbackId(),
       createdAt: Date.now(),
+      locatorVersion: 2,
 
       text: selectionInfo.text,
       formulaLatex: selectionInfo.formulaLatex,
       replyContent: replyContent.trim() || null,
       turnID: selectionInfo.turnID,
-      replyTurnID,
+      replyTurnID: isValidTurnID(replyTurnID)
+        ? replyTurnID
+        : replyTurnID?.turnID ?? null,
 
       rootIndex: selectionInfo.rootIndex,
 
@@ -727,6 +859,11 @@
       suffix: selectionInfo.suffix,
       messageId: selectionInfo.messageId,
       messageRole: selectionInfo.messageRole,
+      conversationId: selectionInfo.conversationId || getConversationId(),
+      turnContainerId: selectionInfo.turnContainerId,
+      turnContainerIds: selectionInfo.turnContainerId
+        ? [selectionInfo.turnContainerId]
+        : [],
       messageStart: selectionInfo.messageStart,
       messageEnd: selectionInfo.messageEnd,
 
@@ -736,8 +873,10 @@
       endOffset: selectionInfo.endOffset,
     };
 
+    applyReplyLocator(bookmark, replyTurnID);
     bookmarks.unshift(bookmark);
     saveBookmarks();
+    void enrichBookmarkLocators(bookmark);
     renderBookmarks();
 
     hideBookmarkButton();
@@ -785,6 +924,53 @@
     );
   }
 
+  function backfillSelectionLocator(bookmark, selectionInfo) {
+    bookmark.locatorVersion = 2;
+    bookmark.locatorUpdatedAt = Date.now();
+    bookmark.conversationId =
+      selectionInfo.conversationId ||
+      bookmark.conversationId ||
+      getConversationId();
+    bookmark.messageId = selectionInfo.messageId || bookmark.messageId;
+    bookmark.messageRole = selectionInfo.messageRole || bookmark.messageRole;
+
+    if (selectionInfo.turnContainerId) {
+      bookmark.turnContainerId = selectionInfo.turnContainerId;
+      bookmark.turnContainerIds = mergeUniqueIds(
+        bookmark.turnContainerIds,
+        [selectionInfo.turnContainerId]
+      );
+    }
+  }
+
+  function applyReplyLocator(bookmark, locator) {
+    if (isValidTurnID(locator)) {
+      bookmark.replyTurnID = locator;
+      return;
+    }
+
+    if (!locator || typeof locator !== 'object') {
+      return;
+    }
+
+    if (isValidTurnID(locator.turnID)) {
+      bookmark.replyTurnID = locator.turnID;
+    }
+    if (locator.messageId) {
+      bookmark.replyMessageId = locator.messageId;
+    }
+    if (locator.messageRole) {
+      bookmark.replyMessageRole = locator.messageRole;
+    }
+    if (locator.turnContainerId) {
+      bookmark.replyTurnContainerId = locator.turnContainerId;
+      bookmark.replyTurnContainerIds = mergeUniqueIds(
+        bookmark.replyTurnContainerIds,
+        [locator.turnContainerId]
+      );
+    }
+  }
+
   function hasNonEmptyOffsets(start, end) {
     return (
       Number.isInteger(start) &&
@@ -806,55 +992,65 @@
    * Jumping and locating
    */
 
-  function jumpToBookmark(bookmark) {
-    discardInvalidTurnID(bookmark, 'turnID');
-
-    if (isValidTurnID(bookmark.turnID)) {
-      const turnContainer = findTurnContainer(bookmark.turnID);
-
-      if (!turnContainer) {
-        showToast('Cannot find the corresponding Turn, content may not be loaded yet');
-        return;
-      }
-
-      turnContainer.scrollIntoView({
-        behavior: 'instant',
-        block: 'center',
-      });
-      setTimeout(() => performBookmarkJump(bookmark, true), 100);
+  async function jumpToBookmark(bookmark) {
+    if (performBookmarkJump(bookmark, false)) {
+      void enrichBookmarkLocators(bookmark);
       return;
     }
 
-    performBookmarkJump(bookmark, false);
+    showToast('Locating Bookmark…');
+
+    try {
+      const mounted = await ensureLocatorMounted(bookmark, 'target');
+      if (mounted) await wait(100);
+      if (performBookmarkJump(bookmark, false)) {
+        return;
+      }
+
+      // Legacy numeric indices are only a last-resort hint. The text must
+      // still match before any recovered locator is persisted.
+      discardInvalidTurnID(bookmark, 'turnID');
+      const legacyTurn = findTurnContainer(bookmark.turnID);
+
+      if (legacyTurn) {
+        legacyTurn.scrollIntoView({ behavior: 'instant', block: 'center' });
+        await wait(500);
+        if (performBookmarkJump(bookmark, false)) {
+          return;
+        }
+      }
+    } catch (error) {
+      console.error('[Text Bookmarks] Bookmark recovery failed:', error);
+    }
+
+    showToast('Cannot find this text, the page content may have changed');
   }
 
-  function performBookmarkJump(bookmark, retryOnFailure) {
+  function performBookmarkJump(bookmark, showFailure = true) {
     const scrollRoot = resolveScrollRoot(bookmark);
 
     if (!scrollRoot) {
-      showToast('Cannot find data-scroll-root');
-      return;
+      if (showFailure) showToast('Cannot find data-scroll-root');
+      return false;
     }
 
     const range = locateBookmarkRange(scrollRoot, bookmark);
 
     if (!range) {
-      if (retryOnFailure) {
-        setTimeout(() => performBookmarkJump(bookmark, false), 500);
-        return;
+      if (showFailure) {
+        showToast('Cannot find this text, the page content may have changed');
       }
-      showToast('Cannot find this text, the page content may have changed');
-      return;
+      return false;
     }
 
     const targetElement = getParentElement(range.startContainer);
 
     if (!targetElement) {
       showToast('Cannot locate the target element, the page content may have changed');
-      return;
+      return false;
     }
 
-    backfillTurnID(bookmark, 'turnID', targetElement);
+    backfillMountedLocator(bookmark, 'target', targetElement);
     scrollRangeToCenter(scrollRoot, range);
     highlightRange(range);
 
@@ -877,9 +1073,10 @@
       scrollRangeToCenter(freshScrollRoot, freshRange);
       highlightRange(freshRange);
     }, 500);
+    return true;
   }
 
-  function jumpToReply(bookmark) {
+  async function jumpToReply(bookmark) {
     const replyContent = normalizeText(bookmark.replyContent);
 
     if (!replyContent) {
@@ -887,32 +1084,31 @@
       return;
     }
 
-    discardInvalidTurnID(bookmark, 'replyTurnID');
-
-    if (isValidTurnID(bookmark.replyTurnID)) {
-      const turnContainer = findTurnContainer(bookmark.replyTurnID);
-
-      if (!turnContainer) {
-        showToast('Cannot find the corresponding Reply Turn, content may not be loaded yet');
-        return;
-      }
-
-      turnContainer.scrollIntoView({
-        behavior: 'instant',
-        block: 'center',
-      });
-      setTimeout(() => {
-        if (!performReplyJump(bookmark, turnContainer, false)) {
-          setTimeout(() => {
-            const freshTurn = findTurnContainer(bookmark.replyTurnID);
-            performReplyJump(bookmark, freshTurn, true);
-          }, 500);
-        }
-      }, 100);
+    if (performReplyJump(bookmark, document, false)) {
+      void enrichBookmarkLocators(bookmark);
       return;
     }
 
-    performReplyJump(bookmark, document, true);
+    showToast('Locating Reply…');
+
+    try {
+      const mounted = await ensureLocatorMounted(bookmark, 'reply');
+      if (mounted) await wait(100);
+      if (performReplyJump(bookmark, document, false)) return;
+
+      discardInvalidTurnID(bookmark, 'replyTurnID');
+      const legacyTurn = findTurnContainer(bookmark.replyTurnID);
+
+      if (legacyTurn) {
+        legacyTurn.scrollIntoView({ behavior: 'instant', block: 'center' });
+        await wait(500);
+        if (performReplyJump(bookmark, legacyTurn, false)) return;
+      }
+    } catch (error) {
+      console.error('[Text Bookmarks] Reply recovery failed:', error);
+    }
+
+    showToast('Cannot find the corresponding Reply');
   }
 
   function performReplyJump(bookmark, searchRoot, showFailure) {
@@ -937,7 +1133,7 @@
       targetRange,
     } = match;
 
-    backfillTurnID(bookmark, 'replyTurnID', targetMessage);
+    backfillMountedLocator(bookmark, 'reply', targetMessage);
 
     const scrollRoot =
       targetMessage.closest(SCROLL_ROOT_SELECTOR) ||
@@ -954,6 +1150,425 @@
 
     highlightRange(targetRange);
     return true;
+  }
+
+  async function ensureLocatorMounted(bookmark, kind) {
+    const fields = getLocatorFields(kind);
+    const existingMessage = findMessageById(bookmark[fields.messageId]);
+
+    if (existingMessage) {
+      backfillMountedLocator(bookmark, kind, existingMessage);
+      return true;
+    }
+
+    let candidates = getBookmarkContainerIds(bookmark, kind);
+    let container = findTurnContainerByIds(candidates);
+
+    if (container) {
+      container.scrollIntoView({ behavior: 'instant', block: 'center' });
+      const mounted = await waitForLocatorMessage(bookmark, kind);
+      if (mounted || !bookmark[fields.messageId]) return true;
+    }
+
+    await resolveBookmarkApiLocator(bookmark, kind);
+    candidates = getBookmarkContainerIds(bookmark, kind);
+    container = findTurnContainerByIds(candidates);
+
+    if (!container && candidates.length) {
+      container = await loadEarlierDomUntilFound(candidates);
+    }
+
+    if (!container) {
+      return false;
+    }
+
+    bookmark[fields.containerId] =
+      container.getAttribute('data-turn-id-container');
+    void saveBookmarks();
+    container.scrollIntoView({ behavior: 'instant', block: 'center' });
+
+    const mounted = await waitForLocatorMessage(bookmark, kind);
+    return Boolean(mounted || !bookmark[fields.messageId]);
+  }
+
+  async function enrichBookmarkLocators(bookmark) {
+    try {
+      await resolveBookmarkApiLocator(bookmark, 'target');
+      if (bookmark.replyContent) {
+        await resolveBookmarkApiLocator(bookmark, 'reply');
+      }
+      await saveBookmarks();
+    } catch (error) {
+      // New bookmarks already contain their currently working DOM anchor.
+      // API enrichment is deliberately best-effort and retries on a jump.
+      console.debug('[Text Bookmarks] Locator enrichment deferred:', error);
+    }
+  }
+
+  async function resolveBookmarkApiLocator(bookmark, kind) {
+    const conversationId =
+      bookmark.conversationId || getConversationId();
+
+    if (!conversationId) return null;
+
+    bookmark.conversationId = conversationId;
+    const fields = getLocatorFields(kind);
+    const wantedMessageId = bookmark[fields.messageId];
+    const wantedText = kind === 'reply'
+      ? bookmark.replyContent
+      : bookmark.text;
+    const wantedRole = kind === 'reply'
+      ? 'user'
+      : bookmark.messageRole;
+
+    let message = await findConversationMessage(
+      conversationId,
+      apiMessage => {
+        if (wantedMessageId) {
+          return apiMessage.id === wantedMessageId;
+        }
+
+        return apiMessageMatchesText(
+          apiMessage,
+          wantedText,
+          wantedRole
+        );
+      }
+    );
+
+    // A message id can disappear after branch edits or frontend migrations.
+    // Once the available pages have been searched, recover by content and
+    // only then replace the stale id.
+    if (!message && wantedMessageId && wantedText) {
+      const cache = conversationApiCache.get(conversationId);
+      message = findBestApiTextMatch(
+        cache?.messages || [],
+        wantedText,
+        wantedRole,
+        kind === 'target' ? bookmark.prefix : '',
+        kind === 'target' ? bookmark.suffix : ''
+      );
+      if (message) bookmark.locatorRecovery = 'text';
+    }
+
+    if (!message) return null;
+
+    const cache = conversationApiCache.get(conversationId);
+    const exchangeId = message.metadata?.turn_exchange_id || null;
+    const exchangeMessages = exchangeId
+      ? cache.messages.filter(
+          item => item.metadata?.turn_exchange_id === exchangeId
+        )
+      : [message];
+    const messageRole = message.author?.role || wantedRole || null;
+    const navigationMessages = messageRole === 'user'
+      ? exchangeMessages.filter(item => item.author?.role === 'user')
+      : exchangeMessages.filter(item => item.author?.role !== 'user');
+    const candidateIds = (navigationMessages.length
+      ? navigationMessages
+      : [message])
+      .map(item => item.id)
+      .filter(Boolean);
+
+    bookmark[fields.messageId] = message.id;
+    bookmark[fields.messageRole] = messageRole;
+    bookmark[fields.exchangeId] = exchangeId;
+    bookmark[fields.containerIds] = mergeUniqueIds(
+      bookmark[fields.containerIds],
+      candidateIds
+    );
+    bookmark.locatorVersion = 2;
+    bookmark.locatorUpdatedAt = Date.now();
+
+    return message;
+  }
+
+  async function findConversationMessage(conversationId, predicate) {
+    const cache = getConversationCache(conversationId);
+
+    for (let page = 0; page < MAX_CONVERSATION_PAGES; page++) {
+      const existing = cache.messages.find(predicate);
+      if (existing) return existing;
+      if (cache.exhausted) return null;
+
+      if (!cache.loading) {
+        cache.loading = fetchNextConversationPage(conversationId, cache)
+          .finally(() => {
+            cache.loading = null;
+          });
+      }
+      await cache.loading;
+    }
+
+    return cache.messages.find(predicate) || null;
+  }
+
+  function getConversationCache(conversationId) {
+    let cache = conversationApiCache.get(conversationId);
+
+    if (!cache) {
+      cache = {
+        messages: [],
+        messageIds: new Set(),
+        initialized: false,
+        nextBefore: null,
+        exhausted: false,
+        loading: null,
+      };
+      conversationApiCache.set(conversationId, cache);
+    }
+
+    return cache;
+  }
+
+  async function fetchNextConversationPage(conversationId, cache) {
+    const base = `/backend-api/conversations/${encodeURIComponent(
+      conversationId
+    )}`;
+    const url = cache.initialized
+      ? `${base}/messages?before=${encodeURIComponent(
+          cache.nextBefore
+        )}&include_has_versions=true&num_turns=${CONVERSATION_PAGE_SIZE}`
+      : `${base}?include_has_versions=true&num_turns=${CONVERSATION_PAGE_SIZE}`;
+    const session = await waitForChatGptRequestAuth();
+    const projectId = session.projectId || getChatGptProjectId();
+
+    if (!session.token) {
+      throw new Error(
+        'ChatGPT request token has not been captured; reload the page and try again'
+      );
+    }
+    const response = await fetch(url, {
+      credentials: 'include',
+      headers: {
+        Accept: 'application/json',
+        ...(session.token
+          ? { Authorization: `Bearer ${session.token}` }
+          : {}),
+        ...(session.accountId
+          ? { 'chatgpt-account-id': session.accountId }
+          : {}),
+        ...(projectId
+          ? { 'chatgpt-project-id': projectId }
+          : {}),
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Conversation API returned ${response.status}`);
+    }
+
+    const data = await response.json();
+    const pageMessages = Array.isArray(data.messages) ? data.messages : [];
+
+    for (const message of pageMessages) {
+      if (!message?.id || cache.messageIds.has(message.id)) continue;
+      cache.messageIds.add(message.id);
+      cache.messages.push(message);
+    }
+
+    cache.initialized = true;
+    cache.nextBefore = data.page_info?.start_cursor || null;
+    cache.exhausted =
+      !data.page_info?.has_previous_page ||
+      !cache.nextBefore ||
+      pageMessages.length === 0;
+  }
+
+  async function waitForChatGptRequestAuth(timeout = 3000) {
+    const deadline = Date.now() + timeout;
+
+    while (!interceptedChatGptAuth.token && Date.now() < deadline) {
+      await wait(50);
+    }
+
+    return interceptedChatGptAuth;
+  }
+
+  function apiMessageMatchesText(message, text, role) {
+    if (role && message.author?.role !== role) return false;
+
+    const needle = normalizeText(text);
+    if (!needle) return false;
+
+    return normalizeText(getApiMessageText(message)).includes(needle);
+  }
+
+  function findBestApiTextMatch(
+    messages,
+    text,
+    role,
+    expectedPrefix,
+    expectedSuffix
+  ) {
+    const needle = normalizeText(text);
+    if (!needle) return null;
+
+    let best = null;
+    let bestScore = -Infinity;
+    let ambiguous = false;
+
+    for (const message of messages) {
+      if (role && message.author?.role !== role) continue;
+
+      const content = normalizeText(getApiMessageText(message));
+      const index = content.indexOf(needle);
+      if (index === -1) continue;
+
+      const end = index + needle.length;
+      const score =
+        needle.length +
+        commonSuffixLength(
+          content.slice(Math.max(0, index - CONTEXT_LENGTH), index),
+          normalizeText(expectedPrefix)
+        ) +
+        commonPrefixLength(
+          content.slice(end, end + CONTEXT_LENGTH),
+          normalizeText(expectedSuffix)
+        ) +
+        (content === needle ? 1000 : 0);
+
+      if (score > bestScore) {
+        best = message;
+        bestScore = score;
+        ambiguous = false;
+      } else if (score === bestScore) {
+        ambiguous = true;
+      }
+    }
+
+    return ambiguous ? null : best;
+  }
+
+  function getApiMessageText(message) {
+    const parts = message?.content?.parts;
+    if (!Array.isArray(parts)) return '';
+
+    return parts
+      .filter(part => typeof part === 'string')
+      .join('\n');
+  }
+
+  async function loadEarlierDomUntilFound(candidateIds) {
+    for (let page = 0; page < MAX_CONVERSATION_PAGES; page++) {
+      const existing = findTurnContainerByIds(candidateIds);
+      if (existing) return existing;
+
+      const loaded = await triggerPreviousDomPage();
+      const found = findTurnContainerByIds(candidateIds);
+      if (found) return found;
+      if (!loaded) break;
+    }
+
+    return null;
+  }
+
+  async function triggerPreviousDomPage() {
+    const before = getTurnContainers().map(
+      element => element.getAttribute('data-turn-id-container')
+    );
+    const firstTurn = getTurnContainers()[0];
+
+    if (!firstTurn) return false;
+
+    const oldFirstId = before[0];
+    const scrollHost =
+      firstTurn.closest(SCROLL_ROOT_SELECTOR) ||
+      findScrollableAncestor(firstTurn) ||
+      document.scrollingElement;
+
+    firstTurn.scrollIntoView({ behavior: 'instant', block: 'start' });
+
+    const changed = waitForCondition(() => {
+      const now = getTurnContainers().map(
+        element => element.getAttribute('data-turn-id-container')
+      );
+      return now[0] !== oldFirstId || now.length > before.length;
+    }, DOM_PAGE_LOAD_TIMEOUT);
+
+    await nextAnimationFrames(2);
+    const currentTop = scrollHost.scrollTop;
+    scrollHost.scrollTop = currentTop > 0
+      ? Math.max(0, currentTop - 200)
+      : 1;
+    await nextAnimationFrames(1);
+    scrollHost.scrollTop = Math.max(0, scrollHost.scrollTop - 1);
+    scrollHost.dispatchEvent(new Event('scroll', { bubbles: true }));
+    window.dispatchEvent(new Event('scroll', { bubbles: true }));
+
+    return changed;
+  }
+
+  function findScrollableAncestor(element) {
+    let current = element?.parentElement;
+
+    while (current) {
+      const style = getComputedStyle(current);
+      if (
+        /(auto|scroll|overlay)/.test(style.overflowY) &&
+        current.scrollHeight > current.clientHeight
+      ) {
+        return current;
+      }
+      current = current.parentElement;
+    }
+
+    return null;
+  }
+
+  async function waitForLocatorMessage(bookmark, kind) {
+    const fields = getLocatorFields(kind);
+    const messageId = bookmark[fields.messageId];
+
+    if (!messageId) return null;
+
+    const message = await waitForCondition(
+      () => findMessageById(messageId),
+      MESSAGE_MOUNT_TIMEOUT
+    );
+
+    if (message) backfillMountedLocator(bookmark, kind, message);
+    return message;
+  }
+
+  function waitForCondition(predicate, timeout) {
+    const immediate = predicate();
+    if (immediate) return Promise.resolve(immediate);
+
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = value => {
+        if (settled) return;
+        settled = true;
+        observer.disconnect();
+        clearTimeout(timer);
+        resolve(value);
+      };
+      const observer = new MutationObserver(() => {
+        const value = predicate();
+        if (value) finish(value);
+      });
+      const timer = setTimeout(() => finish(predicate() || false), timeout);
+
+      observer.observe(document.body, { childList: true, subtree: true });
+    });
+  }
+
+  function nextAnimationFrames(count) {
+    return new Promise(resolve => {
+      const next = () => {
+        if (--count <= 0) {
+          resolve();
+        } else {
+          requestAnimationFrame(next);
+        }
+      };
+      requestAnimationFrame(next);
+    });
+  }
+
+  function wait(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
   }
 
   function findReplyMatch(searchRoot, replyContent) {
@@ -998,20 +1613,91 @@
     return getTurnContainers()[turnID] ?? null;
   }
 
-  function backfillTurnID(bookmark, field, targetElement) {
-    if (isValidTurnID(bookmark[field])) {
-      return;
-    }
+  function findTurnContainerByIds(ids) {
+    const wanted = new Set((ids || []).filter(Boolean));
+    if (!wanted.size) return null;
 
+    return getTurnContainers().find(container =>
+      wanted.has(container.getAttribute('data-turn-id-container'))
+    ) || null;
+  }
+
+  function findMessageById(messageId) {
+    if (!messageId) return null;
+
+    return [...document.querySelectorAll(MESSAGE_SELECTOR)].find(
+      message => message.getAttribute('data-message-id') === messageId
+    ) || null;
+  }
+
+  function getLocatorFields(kind) {
+    return kind === 'reply'
+      ? {
+          messageId: 'replyMessageId',
+          messageRole: 'replyMessageRole',
+          exchangeId: 'replyTurnExchangeId',
+          containerId: 'replyTurnContainerId',
+          containerIds: 'replyTurnContainerIds',
+          legacyTurnId: 'replyTurnID',
+        }
+      : {
+          messageId: 'messageId',
+          messageRole: 'messageRole',
+          exchangeId: 'turnExchangeId',
+          containerId: 'turnContainerId',
+          containerIds: 'turnContainerIds',
+          legacyTurnId: 'turnID',
+        };
+  }
+
+  function getBookmarkContainerIds(bookmark, kind) {
+    const fields = getLocatorFields(kind);
+    return mergeUniqueIds(
+      bookmark[fields.containerId]
+        ? [bookmark[fields.containerId]]
+        : [],
+      bookmark[fields.containerIds]
+    );
+  }
+
+  function backfillMountedLocator(bookmark, kind, targetElement) {
+    const fields = getLocatorFields(kind);
+    const message = targetElement.matches?.(MESSAGE_SELECTOR)
+      ? targetElement
+      : targetElement.closest?.(MESSAGE_SELECTOR);
+    const container = targetElement.closest?.(TURN_CONTAINER_SELECTOR);
+    const containerId = container?.getAttribute('data-turn-id-container');
     const turnID = getTurnIndex(targetElement);
 
-    if (!isValidTurnID(turnID)) {
-      delete bookmark[field];
-      return;
+    if (message?.getAttribute('data-message-id')) {
+      bookmark[fields.messageId] = message.getAttribute('data-message-id');
+      bookmark[fields.messageRole] =
+        message.getAttribute('data-message-author-role') ||
+        bookmark[fields.messageRole] ||
+        null;
     }
+    if (containerId) {
+      bookmark[fields.containerId] = containerId;
+      bookmark[fields.containerIds] = mergeUniqueIds(
+        bookmark[fields.containerIds],
+        [containerId]
+      );
+    }
+    if (isValidTurnID(turnID)) {
+      bookmark[fields.legacyTurnId] = turnID;
+    }
+    bookmark.conversationId = bookmark.conversationId || getConversationId();
+    bookmark.locatorVersion = 2;
+    bookmark.locatorUpdatedAt = Date.now();
+    void saveBookmarks();
+  }
 
-    bookmark[field] = turnID;
-    saveBookmarks();
+  function mergeUniqueIds(...groups) {
+    return [...new Set(
+      groups
+        .flatMap(group => Array.isArray(group) ? group : [])
+        .filter(value => typeof value === 'string' && value)
+    )];
   }
 
   function isValidTurnID(turnID) {
@@ -1026,13 +1712,7 @@
   }
 
   function getTurnContainers() {
-    return [...document.querySelectorAll(
-      'div[data-turn-id-container]'
-    )].filter(
-      element =>
-        element.getAttribute('data-turn-id-container') !==
-        'client-created-root'
-    );
+    return [...document.querySelectorAll(TURN_CONTAINER_SELECTOR)];
   }
 
   function getTurnIndex(targetElement) {
@@ -1068,22 +1748,34 @@
       replyTurnMonitorTimers.delete(timer);
 
       const newTurns = currentTurns.slice(initialTurnCount);
-      let replyTurnID = null;
+      let replyLocator = null;
 
       for (let index = newTurns.length - 1; index >= 0; index--) {
         const match = findReplyMatch(newTurns[index], replyContent);
 
         if (match) {
-          replyTurnID = getTurnIndex(match.targetMessage);
+          const replyContainer = match.targetMessage.closest(
+            TURN_CONTAINER_SELECTOR
+          );
+          replyLocator = {
+            turnID: getTurnIndex(match.targetMessage),
+            messageId: match.targetMessage.getAttribute('data-message-id'),
+            messageRole: match.targetMessage.getAttribute(
+              'data-message-author-role'
+            ),
+            turnContainerId: replyContainer?.getAttribute(
+              'data-turn-id-container'
+            ) || null,
+          };
           break;
         }
       }
 
-      if (isValidTurnID(replyTurnID)) {
+      if (isValidTurnID(replyLocator?.turnID)) {
         createBookmarkFromPendingSelection(
           replyContent,
           selectionInfo,
-          replyTurnID
+          replyLocator
         );
         showToast('Reply has been sent and Bookmark added');
       }
@@ -2506,6 +3198,22 @@
 
   function getUrlKey() {
     return getLastPathPart(location.pathname);
+  }
+
+  function getConversationId() {
+    const parts = location.pathname.split('/').filter(Boolean);
+    const conversationMarker = parts.lastIndexOf('c');
+    return conversationMarker !== -1
+      ? parts[conversationMarker + 1] || ''
+      : '';
+  }
+
+  function getChatGptProjectId() {
+    const parts = location.pathname.split('/').filter(Boolean);
+    const projectMarker = parts.lastIndexOf('g');
+    return projectMarker !== -1
+      ? parts[projectMarker + 1] || ''
+      : '';
   }
 
   function getLastPathPart(pathOrUrl) {
