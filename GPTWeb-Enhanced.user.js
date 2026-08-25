@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      1.1.2
+// @version      1.2.0
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -185,6 +185,14 @@
   let autoExpandTimer = null;
   const replyTurnMonitorTimers = new Set();
   const conversationApiCache = new Map();
+  const persistentHighlightRanges = new Map();
+  const observedTurnContainers = new WeakSet();
+  const intersectingTurnContainers = new Set();
+  let persistentBookmarkHighlight = null;
+  let persistentReplyHighlight = null;
+  let persistentHighlightObserver = null;
+  let persistentHighlightMutationObserver = null;
+  let persistentHighlightRefreshTimer = null;
 
   init();
 
@@ -199,6 +207,7 @@
     document.addEventListener('selectionchange', handleSelectionChange);
     // document.addEventListener('copy', handleGlobalCopy, true);
     installUrlChangeListener();
+    initializePersistentHighlights();
 
     renderBookmarks();
     syncWindowCollapsedAfterUrlSettles();
@@ -290,6 +299,8 @@
     bookmarks = await loadBookmarks(urlKey);
     renderBookmarks();
     syncWindowCollapsedAfterUrlSettles();
+    resetPersistentHighlights();
+    schedulePersistentHighlightRefresh();
   }
 
   async function initializeBookmarks() {
@@ -818,6 +829,12 @@
       saveBookmarks();
       void enrichBookmarkLocators(existingBookmark);
       renderBookmarks();
+      setPersistentHighlightRange(
+        existingBookmark.id,
+        'target',
+        selectionInfo.range.cloneRange()
+      );
+      schedulePersistentHighlightRefresh();
 
       hideBookmarkButton();
       clearBrowserSelection();
@@ -871,6 +888,12 @@
     saveBookmarks();
     void enrichBookmarkLocators(bookmark);
     renderBookmarks();
+    setPersistentHighlightRange(
+      bookmark.id,
+      'target',
+      selectionInfo.range.cloneRange()
+    );
+    schedulePersistentHighlightRefresh();
 
     hideBookmarkButton();
     clearBrowserSelection();
@@ -2063,6 +2086,180 @@
    * Highlighting
    */
 
+  function initializePersistentHighlights() {
+    if (!CSS.highlights || typeof Highlight === 'undefined') return;
+
+    persistentBookmarkHighlight = new Highlight();
+    persistentReplyHighlight = new Highlight();
+    CSS.highlights.set(
+      'tm-bookmark-persistent',
+      persistentBookmarkHighlight
+    );
+    CSS.highlights.set('tm-reply-persistent', persistentReplyHighlight);
+
+    persistentHighlightObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        if (entry.isIntersecting) {
+          intersectingTurnContainers.add(entry.target);
+        } else {
+          intersectingTurnContainers.delete(entry.target);
+        }
+      }
+      schedulePersistentHighlightRefresh();
+    }, {
+      root: null,
+      rootMargin: '800px 0px',
+    });
+
+    persistentHighlightMutationObserver = new MutationObserver(mutations => {
+      let needsRefresh = false;
+
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            observeTurnContainers(node);
+          }
+          needsRefresh = true;
+        }
+        if (mutation.type === 'characterData') needsRefresh = true;
+        if (mutation.removedNodes.length) needsRefresh = true;
+      }
+
+      if (needsRefresh) schedulePersistentHighlightRefresh();
+    });
+
+    persistentHighlightMutationObserver.observe(document.documentElement, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+    });
+    observeTurnContainers(document);
+  }
+
+  function observeTurnContainers(root) {
+    if (!persistentHighlightObserver) return;
+
+    const containers = [
+      ...(root.matches?.(TURN_CONTAINER_SELECTOR) ? [root] : []),
+      ...root.querySelectorAll(TURN_CONTAINER_SELECTOR),
+    ];
+
+    for (const container of containers) {
+      if (observedTurnContainers.has(container)) continue;
+      observedTurnContainers.add(container);
+      persistentHighlightObserver.observe(container);
+    }
+  }
+
+  function schedulePersistentHighlightRefresh() {
+    if (!persistentHighlightObserver || persistentHighlightRefreshTimer) {
+      return;
+    }
+    persistentHighlightRefreshTimer = setTimeout(
+      refreshPersistentHighlights,
+      120
+    );
+  }
+
+  function refreshPersistentHighlights() {
+    persistentHighlightRefreshTimer = null;
+    prunePersistentHighlightRanges();
+
+    for (const container of [...intersectingTurnContainers]) {
+      if (!container.isConnected) {
+        intersectingTurnContainers.delete(container);
+        continue;
+      }
+      highlightBookmarksInContainer(container);
+    }
+  }
+
+  function highlightBookmarksInContainer(container) {
+    if (!container.querySelector(MESSAGE_SELECTOR)) return;
+
+    for (const bookmark of bookmarks) {
+      const targetRange = locatePersistentBookmarkRange(container, bookmark);
+      if (targetRange) {
+        setPersistentHighlightRange(bookmark.id, 'target', targetRange);
+      }
+
+      if (bookmark.replyContent) {
+        const replyMatch = findReplyMatch(container, bookmark.replyContent);
+        if (replyMatch) {
+          setPersistentHighlightRange(
+            bookmark.id,
+            'reply',
+            replyMatch.targetRange
+          );
+        }
+      }
+    }
+  }
+
+  function locatePersistentBookmarkRange(container, bookmark) {
+    if (!bookmark?.text) return null;
+
+    // Use the strongest locator first, but only accept it when it belongs to
+    // this visible turn. Old records then fall through to local text/context
+    // recovery without scanning the rest of the conversation.
+    const messageRange = locateInMessage(bookmark);
+    if (
+      messageRange &&
+      container.contains(messageRange.startContainer) &&
+      container.contains(messageRange.endContainer)
+    ) {
+      return messageRange;
+    }
+
+    return (
+      locateKatexFormula(container, bookmark) ||
+      locateByTextContext(container, bookmark)
+    );
+  }
+
+  function setPersistentHighlightRange(bookmarkId, kind, range) {
+    const key = `${bookmarkId}:${kind}`;
+    const highlight = kind === 'reply'
+      ? persistentReplyHighlight
+      : persistentBookmarkHighlight;
+    const previous = persistentHighlightRanges.get(key);
+
+    if (!highlight || previous?.range === range) return;
+    if (previous) previous.highlight.delete(previous.range);
+
+    highlight.add(range);
+    persistentHighlightRanges.set(key, { highlight, range });
+  }
+
+  function prunePersistentHighlightRanges() {
+    for (const [key, entry] of persistentHighlightRanges) {
+      const startElement = getParentElement(entry.range.startContainer);
+      const endElement = getParentElement(entry.range.endContainer);
+
+      if (!startElement?.isConnected || !endElement?.isConnected) {
+        entry.highlight.delete(entry.range);
+        persistentHighlightRanges.delete(key);
+      }
+    }
+  }
+
+  function removePersistentBookmarkRanges(bookmarkId) {
+    for (const kind of ['target', 'reply']) {
+      const key = `${bookmarkId}:${kind}`;
+      const entry = persistentHighlightRanges.get(key);
+      if (!entry) continue;
+      entry.highlight.delete(entry.range);
+      persistentHighlightRanges.delete(key);
+    }
+  }
+
+  function resetPersistentHighlights() {
+    for (const entry of persistentHighlightRanges.values()) {
+      entry.highlight.delete(entry.range);
+    }
+    persistentHighlightRanges.clear();
+  }
+
   function highlightRange(range) {
     clearCurrentHighlight();
 
@@ -3081,6 +3278,8 @@
     bookmarks = bookmarks.filter(bookmark => bookmark.id !== id);
     saveBookmarks();
     renderBookmarks();
+    removePersistentBookmarkRanges(id);
+    schedulePersistentHighlightRefresh();
   }
 
   function setWindowCollapsed(collapsed) {
@@ -3413,6 +3612,7 @@
 
       hideBookmarkButton();
       clearCurrentHighlight();
+      resetPersistentHighlights();
       currentUrlKey = nextUrlKey;
       void refreshBookmarks(currentUrlKey);
     });
@@ -3758,6 +3958,20 @@
       ::highlight(tm-bookmark-highlight) {
         background: rgba(255, 210, 40, 0.65);
         color: inherit;
+      }
+
+      ::highlight(tm-bookmark-persistent) {
+        background: rgba(250, 204, 21, 0.25);
+        color: inherit;
+        text-decoration: underline rgba(234, 179, 8, 0.7) 1px;
+        text-underline-offset: 2px;
+      }
+
+      ::highlight(tm-reply-persistent) {
+        background: rgba(96, 165, 250, 0.22);
+        color: inherit;
+        text-decoration: underline rgba(59, 130, 246, 0.7) 1px;
+        text-underline-offset: 2px;
       }
 
       @keyframes tm-bookmark-window-flash {
