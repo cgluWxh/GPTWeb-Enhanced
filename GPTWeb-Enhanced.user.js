@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Web Enhanced: Copy & Bookmark
 // @namespace    https://831.moe/
-// @version      1.2.0
+// @version      1.3.2
 // @description  Copy selected text as Markdown, bookmark selections, and jump to them later. Works on ChatGPT Web.
 // @author       cgluWxh
 // @match        https://chat.openai.com/*
@@ -193,6 +193,8 @@
   let persistentHighlightObserver = null;
   let persistentHighlightMutationObserver = null;
   let persistentHighlightRefreshTimer = null;
+  let consumedBookmarkDeepLink = '';
+  let activeBookmarkDeepLink = '';
 
   init();
 
@@ -301,6 +303,7 @@
     syncWindowCollapsedAfterUrlSettles();
     resetPersistentHighlights();
     schedulePersistentHighlightRefresh();
+    void maybeJumpToLinkedBookmark();
   }
 
   async function initializeBookmarks() {
@@ -3194,6 +3197,7 @@
     for (const bookmark of bookmarks) {
       const item = document.createElement('div');
       item.className = 'tm-bookmark-item';
+      let jumpClickTimer = null;
 
       const jumpButton = document.createElement('button');
       jumpButton.type = 'button';
@@ -3212,8 +3216,12 @@
       meta.textContent = formatDate(bookmark.createdAt);
 
       jumpButton.append(text, meta);
-      jumpButton.addEventListener('click', () => {
-        jumpToBookmark(bookmark);
+      jumpButton.addEventListener('click', event => {
+        if (event.detail > 1) return;
+        jumpClickTimer = setTimeout(() => {
+          jumpClickTimer = null;
+          jumpToBookmark(bookmark);
+        }, 220);
       });
 
       const replyJumpButton = document.createElement('button');
@@ -3225,6 +3233,11 @@
       replyJumpButton.addEventListener('click', event => {
         event.stopPropagation();
         jumpToReply(bookmark);
+      });
+      replyJumpButton.addEventListener('contextmenu', event => {
+        event.preventDefault();
+        event.stopPropagation();
+        void copyBookmarkLink(bookmark, 'reply');
       });
 
       const deleteButton = document.createElement('button');
@@ -3244,12 +3257,187 @@
         item.append(replyJumpButton);
       }
       item.append(deleteButton);
+      item.addEventListener('dblclick', event => {
+        if (event.target.closest(
+          '.tm-bookmark-reply-jump, .tm-bookmark-delete'
+        )) {
+          return;
+        }
+        event.preventDefault();
+        clearTimeout(jumpClickTimer);
+        jumpClickTimer = null;
+        renameBookmark(bookmark);
+      });
       item.addEventListener('contextmenu', event => {
         event.preventDefault();
-        renameBookmark(bookmark);
+        void copyBookmarkLink(bookmark, 'mark');
       });
       bookmarkList.appendChild(item);
     }
+  }
+
+  function createBookmarkLink(bookmark, target) {
+    const url = new URL(location.href);
+    url.searchParams.set('bookmark', bookmark.id);
+    url.searchParams.set('target', target === 'reply' ? 'reply' : 'mark');
+    return url.href;
+  }
+
+  async function copyBookmarkLink(bookmark, target) {
+    const copied = await copyTextToClipboard(
+      createBookmarkLink(bookmark, target)
+    );
+    showToast(copied
+      ? `${target === 'reply' ? 'Reply' : 'Bookmark'} link copied`
+      : 'Copy failed, please check clipboard permissions');
+  }
+
+  async function copyTextToClipboard(text) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.documentElement.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      textarea.remove();
+      return copied;
+    }
+  }
+
+  async function maybeJumpToLinkedBookmark() {
+    const url = new URL(location.href);
+    const bookmarkId = url.searchParams.get('bookmark') || '';
+    const target = url.searchParams.get('target');
+
+    if (!bookmarkId || !['mark', 'reply'].includes(target)) return;
+
+    const linkedUrlKey = getUrlKey();
+    const signature = `${linkedUrlKey}:${bookmarkId}:${target}`;
+    if (
+      consumedBookmarkDeepLink === signature ||
+      activeBookmarkDeepLink === signature
+    ) {
+      return;
+    }
+    activeBookmarkDeepLink = signature;
+
+    let bookmark = null;
+
+    try {
+      // Route transitions, cloud authentication and IndexedDB initialization
+      // can finish in different orders. Keep retrying the storage read instead
+      // of treating the first empty list as a definitive missing bookmark.
+      const deadline = Date.now() + 20000;
+
+      while (Date.now() < deadline) {
+        const currentUrl = new URL(location.href);
+        const linkIsStillCurrent =
+          getUrlKey() === linkedUrlKey &&
+          currentUrl.searchParams.get('bookmark') === bookmarkId &&
+          currentUrl.searchParams.get('target') === target;
+
+        if (!linkIsStillCurrent) return;
+
+        bookmark = bookmarks.find(item => item.id === bookmarkId) || null;
+        if (bookmark) break;
+
+        try {
+          const reloadedBookmarks = await loadBookmarks(linkedUrlKey);
+          bookmark = reloadedBookmarks.find(
+            item => item.id === bookmarkId
+          ) || null;
+
+          if (bookmark && getUrlKey() === linkedUrlKey) {
+            bookmarks = reloadedBookmarks;
+            renderBookmarks();
+            syncWindowCollapsedAfterUrlSettles();
+            resetPersistentHighlights();
+            schedulePersistentHighlightRefresh();
+            break;
+          }
+        } catch (error) {
+          console.debug(
+            '[Text Bookmarks] Deep link bookmark reload deferred:',
+            error
+          );
+        }
+
+        await wait(750);
+      }
+
+      if (!bookmark) {
+        showToast('Cannot find the Bookmark from this link');
+        return;
+      }
+      if (target === 'reply' && !bookmark.replyContent) {
+        showToast('This Bookmark has no Reply target');
+        return;
+      }
+
+      if (document.readyState === 'loading') {
+        await new Promise(resolve => {
+          window.addEventListener('DOMContentLoaded', resolve, { once: true });
+        });
+      }
+      const conversationReady = await waitForConversationAjaxReady(30000);
+      if (!conversationReady) {
+        // Do not consume the link while ChatGPT is still showing only its
+        // shell. A later retry can continue after its AJAX request finishes.
+        setTimeout(() => void maybeJumpToLinkedBookmark(), 1000);
+        return;
+      }
+
+      consumedBookmarkDeepLink = signature;
+
+      if (target === 'reply') {
+        await jumpToReply(bookmark);
+      } else {
+        await jumpToBookmark(bookmark);
+      }
+    } finally {
+      if (activeBookmarkDeepLink === signature) {
+        activeBookmarkDeepLink = '';
+      }
+    }
+  }
+
+  async function waitForConversationAjaxReady(timeout) {
+    const deadline = Date.now() + timeout;
+
+    while (Date.now() < deadline) {
+      const remaining = Math.max(0, deadline - Date.now());
+      const readyContainer = await waitForCondition(() => {
+        const containers = getTurnContainers();
+        return containers.find(container => {
+          const message = container.querySelector(MESSAGE_SELECTOR);
+          const scrollRoot = container.closest(SCROLL_ROOT_SELECTOR);
+          return message && scrollRoot;
+        }) || false;
+      }, Math.min(remaining, 5000));
+
+      if (!readyContainer) continue;
+
+      // The first successful mutation may be an intermediate React tree.
+      // Require the mounted conversation subtree to survive a short quiet
+      // period before starting pagination and range recovery.
+      await nextAnimationFrames(2);
+      await wait(300);
+
+      if (
+        readyContainer.isConnected &&
+        readyContainer.closest(SCROLL_ROOT_SELECTOR) &&
+        readyContainer.querySelector(MESSAGE_SELECTOR)
+      ) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   function renameBookmark(bookmark) {
@@ -3607,6 +3795,7 @@
 
       if (nextUrlKey === currentUrlKey) {
         syncWindowCollapsedAfterUrlSettles();
+        void maybeJumpToLinkedBookmark();
         return;
       }
 
